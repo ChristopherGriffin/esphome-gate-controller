@@ -501,15 +501,15 @@ external_components:
 # NETWORK OVERRIDES (gate-specific additions to esp_common defaults)
 #############################################################################################
 
-api:
-  encryption:
-    key: !secret api_encryption_key
+# api:
+#   encryption:
+#     key: !secret api_encryption_key
 
-ota:
-  password: !secret ota_password
+# ota:
+#   password: !secret ota_password
 
-web_server:
-  version: 2
+# web_server:
+#   version: 2
 
 #############################################################################################
 # ENDSTOP SAFETY WATCHDOG (runs independently of FSM and scripts)
