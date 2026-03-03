@@ -1,0 +1,154 @@
+#==============================================================================
+# Wemos D1 Mini32 - Hardware Package
+#==============================================================================
+# File: common/wemos_d1_mini32.yaml
+#
+# Hardware-specific configuration for Wemos D1 Mini32 (ESP32).
+# Defines board, status LED with connection-aware effects, and OTA tracking.
+#
+# DEPENDENCIES:
+#   - common/esp_common.yaml (provides esphome config, connectivity, sensors)
+#
+# REQUIRED SUBSTITUTIONS (from esp_common.yaml):
+#   - device_name     : ESPHome device name
+#   - friendly_name   : Human-readable device name
+#   - name_no_dashes  : Device name without dashes for IDs
+#
+# PROVIDES:
+#   IDs:
+#     - status_led          : Monochromatic light for connection status
+#     - status_led_output   : LEDC PWM output (GPIO2)
+#     - update_status_led   : Script to refresh LED based on connectivity
+#     - ota_in_progress     : Global bool for OTA state tracking
+#
+# LED BEHAVIOR (GPIO2 - onboard blue LED):
+#   Fast blink (0.5s) : WiFi disconnected
+#   Solid ON          : WiFi connected, API disconnected
+#   Slow glow (2s)    : WiFi connected, API connected
+#
+# USAGE:
+#   packages:
+#     base: !include common/esp_common.yaml
+#     hardware: !include common/wemos_d1_mini32.yaml
+#==============================================================================
+
+substitutions:
+  status_led_pin: GPIO2
+
+#------------------------------------------------------------------------------
+# ESP32 Board Configuration
+#------------------------------------------------------------------------------
+esp32:
+  board: wemos_d1_mini32
+  framework:
+    type: esp-idf
+
+#------------------------------------------------------------------------------
+# OTA Tracking
+#------------------------------------------------------------------------------
+globals:
+  - id: ota_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+#------------------------------------------------------------------------------
+# Status LED Output (PWM for glow effect)
+#------------------------------------------------------------------------------
+output:
+  - platform: ledc
+    id: status_led_output
+    pin: ${status_led_pin}
+    frequency: 1000Hz
+
+#------------------------------------------------------------------------------
+# Status LED Light Component
+#------------------------------------------------------------------------------
+light:
+  - platform: monochromatic
+    id: status_led
+    output: status_led_output
+    internal: true
+    default_transition_length: 0ms
+    effects:
+      # Fast blink for WiFi disconnected
+      - strobe:
+          name: "Fast Blink"
+          colors:
+            - state: true
+              brightness: 100%
+              duration: 500ms
+            - state: false
+              duration: 500ms
+      # Slow glow for fully connected (WiFi + API)
+      - lambda:
+          name: "Slow Glow"
+          update_interval: 40ms
+          lambda: |-
+            static float phase = 0;
+            phase += 0.05;  // ~2s full cycle (50 steps * 40ms * 2)
+            if (phase > 3.14159) phase = -3.14159;
+            float brightness = (sin(phase) + 1.0) / 2.0;  // 0.0 to 1.0
+            auto call = id(status_led).turn_on();
+            call.set_brightness(brightness);
+            call.set_transition_length(0);
+            call.perform();
+
+#------------------------------------------------------------------------------
+# Status LED Control Script
+#------------------------------------------------------------------------------
+script:
+  - id: update_status_led
+    then:
+      - if:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - light.turn_on:
+                id: status_led
+                brightness: 100%
+                effect: "Fast Blink"
+          else:
+            - if:
+                condition:
+                  api.connected:
+                then:
+                  - light.turn_on:
+                      id: status_led
+                      brightness: 100%
+                      effect: "Slow Glow"
+                else:
+                  - light.turn_on:
+                      id: status_led
+                      brightness: 100%
+                      effect: none
+
+#------------------------------------------------------------------------------
+# Connectivity Callbacks (triggers LED update on state changes)
+#------------------------------------------------------------------------------
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: update_status_led
+
+api:
+  on_client_connected:
+    - script.execute: update_status_led
+  on_client_disconnected:
+    - script.execute: update_status_led
+
+wifi:
+  on_connect:
+    - script.execute: update_status_led
+  on_disconnect:
+    - script.execute: update_status_led
+
+#------------------------------------------------------------------------------
+# Periodic Status Check (backup for missed events)
+#------------------------------------------------------------------------------
+interval:
+  - interval: 30s
+    then:
+      - script.execute: update_status_led

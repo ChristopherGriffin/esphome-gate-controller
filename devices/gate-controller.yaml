@@ -1,0 +1,2519 @@
+#############################################################################################
+#                                                                                           #
+#                           GATE CONTROLLER V2.3 - FSM BASED                                #
+#                                                                                           #
+#############################################################################################
+#
+# OVERVIEW
+# ========
+# This ESPHome configuration implements a smart gate controller using a Finite State Machine
+# (FSM) architecture. It replaces the traditional ESPHome template cover approach with a
+# cleaner, more maintainable design where:
+#   - The FSM owns all state logic and transitions
+#   - The cover component is a thin UI facade that sends commands to the FSM
+#   - Scripts handle discrete tasks (motor control, soft start/stop, position tracking)
+#   - Two intervals: endstop safety watchdog (100ms) and panel LED update (250ms)
+#
+# HARDWARE
+# ========
+# - ESP32 D1 Mini (Wemos D1 Mini32)
+# - MCP23017 I2C GPIO Expander (address 0x20)
+#   Port A - Inputs:
+#     GPA0: Open endstop switch
+#     GPA1: Close endstop switch  
+#     GPA2: Cycle button (one-button control, momentary)
+#     GPA3: OPEN button (hold-to-operate / dead man's switch)
+#     GPA4: CLOSE button (hold-to-operate / dead man's switch)
+#     GPA5: STOP button (dedicated emergency stop, momentary)
+#     GPA6: Reboot/Reset button (3s hold = reboot, 10s hold = reset times + reboot)
+#     GPA7: (spare)
+#   Port B - LED Outputs:
+#     GPB0: Open endstop LED (green)   - on when at open limit
+#     GPB1: Closed endstop LED (green) - on when at close limit
+#     GPB2: Opening LED (amber)        - on while opening
+#     GPB3: Closing LED (amber)        - on while closing
+#     GPB4: Auto-close LED (blue)      - on when armed, 1Hz flash during countdown
+#     GPB5: Fault LED (red)            - solid = fault, 2Hz flash
+#     GPB6: Stop LED (red)             - on when stopped mid-travel
+#     GPB7: (spare)
+# - INA260 Current Sensor (address 0x40) - for motor current monitoring
+# - PWM motor driver on GPIO16 (open) and GPIO17 (close)
+# - Power LED wired directly to 3.3V (no GPIO needed)
+#
+# ARCHITECTURE
+# ============
+#
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  Home Assistant / Web UI                                        │
+#   └─────────────────────┬───────────────────────────────────────────┘
+#                         │ open/close/stop/position
+#                         ▼
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  Cover (facade only - sends FSM inputs)                         │
+#   │  - open_action     → OPEN_CMD                                   │
+#   │  - close_action    → CLOSE_CMD                                  │
+#   │  - stop_action     → STOP                                       │
+#   │  - position_action → move_to_position script                    │
+#   └─────────────────────┬───────────────────────────────────────────┘
+#                         │
+#                         ▼
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  FSM (owns all state logic)                                     │
+#   │  States: STOPPED_UNKNOWN, OPENING, OPENING_CYCLE, OPEN,         │
+#   │          OPEN_CYCLE, CLOSING, CLOSED, PAUSED_FROM_OPENING,      │
+#   │          PAUSED_FROM_CLOSING, STOPPED, FAULT                    │
+#   │  Inputs: CYCLE, OPEN_CMD, CLOSE_CMD, STOP, OPEN_ENDSTOP,        │
+#   │          CLOSE_ENDSTOP, FAULT_CMD                               │
+#   └───────┬─────────────────────────────────────────────────────────┘
+#           │
+#           ▼
+#   ┌─────────────────────────────────────────────────────────────────┐
+#   │  Scripts                                                        │
+#   │  Motor:    motor_stop, motor_start, apply_pwm                   │
+#   │  PWM:      soft_start_ramp, soft_stop_ramp                      │
+#   │  Position: position_tracking, move_to_position                  │
+#   │  Auto:     auto_close_countdown, cancel_auto_close              │
+#   │  Safety:   obstacle_monitor, clear_obstacle_state,              │
+#   │            movement_timeout                                     │
+#   │  Init:     check_initial_state, enter_idle_state                │
+#   └─────────────────────────────────────────────────────────────────┘
+#
+# FSM STATE DIAGRAM
+# =================
+#
+#                          ┌──────────────────┐
+#                          │  STOPPED_UNKNOWN │ (initial boot state)
+#                          └────────┬─────────┘
+#                    OPEN_ENDSTOP   │   CLOSE_ENDSTOP
+#                  ┌────────────────┴────────────────┐
+#                  ▼                                 ▼
+#            ┌──────────┐                     ┌──────────┐
+#            │   OPEN   │                     │  CLOSED  │
+#            └────┬─────┘                     └────┬─────┘
+#                 │                                │
+#                 │ CLOSE_CMD                      │ OPEN_CMD (no auto-close)
+#                 │                                │ CYCLE (with auto-close)
+#                 ▼                                ▼
+#            ┌──────────┐                     ┌──────────────┐
+#            │ CLOSING  │◄───────────────────►│   OPENING    │ (OPEN_CMD path)
+#            └────┬─────┘    reverse cmd      │ OPENING_CYCLE│ (CYCLE path)
+#                 │                           └──────┬───────┘
+#            CYCLE│                            CYCLE │
+#                 ▼                                  ▼
+#   ┌─────────────────────────┐      ┌─────────────────────────┐
+#   │  PAUSED_FROM_CLOSING    │      │  PAUSED_FROM_OPENING    │
+#   └───────────┬─────────────┘      └───────────┬─────────────┘
+#               │ CYCLE                          │ CYCLE
+#               ▼                                ▼
+#            OPENING                          CLOSING
+#            (no auto-close)
+#
+#   OPEN_ENDSTOP transitions:
+#     OPENING       → OPEN       (no auto-close)
+#     OPENING_CYCLE → OPEN_CYCLE (starts countdown)
+#
+#   OPEN_CYCLE: CYCLE → OPEN (cancels countdown)
+#
+# CHANGES IN V2.3  (vs V2.2) — CRITICAL SAFETY FIX: ENDSTOP OVERRUN
+# ===================================================================
+#
+# ROOT CAUSE: on_press is EDGE-TRIGGERED (fires only on OFF→ON transition).
+# V2.2's direct PWM kill in on_press correctly zeroed the motor, BUT running
+# scripts (soft_stop_ramp, position_tracking) could write PWM BACK on their
+# very next loop iteration — before their while-condition detected the state
+# change. Since on_press had already fired, there was no second trigger.
+# The motor re-activated, drove the gate through the endstop, and hit the wall.
+#
+# FIX LAYERS (defense in depth):
+#
+# Layer 1: motor_kill GLOBAL INTERLOCK
+#   - New boolean global: when true, apply_pwm ALWAYS writes zero
+#   - Set by: endstop on_press, motor_stop, obstacle FAULT, movement timeout
+#   - Cleared ONLY by: motor_start (intentional motion)
+#   - Even if a stale script calls apply_pwm, the kill switch blocks it
+#
+# Layer 2: EXPLICIT script.stop IN ENDSTOP HANDLERS
+#   - Endstop on_press now calls script.stop on ALL 5 motion scripts:
+#     soft_start_ramp, soft_stop_ramp, position_tracking,
+#     obstacle_monitor, movement_timeout
+#   - Scripts are terminated before FSM transition, not after
+#   - No running script survives to write PWM back
+#
+# Layer 3: motor_kill CHECK IN ALL WHILE-LOOP CONDITIONS
+#   - Every motion script's while condition now checks motor_kill first
+#   - If motor_kill is true, the loop exits immediately on next condition check
+#   - Belt-and-suspenders: even if script.stop somehow fails, the loop self-terminates
+#
+# Layer 4: LEVEL-TRIGGERED ENDSTOP CHECKS IN LOOP BODIES
+#   - soft_start_ramp and soft_stop_ramp check endstop state at the TOP of each iteration
+#   - If endstop is active in direction of travel → immediate hardware kill + motor_kill
+#   - This catches the case where PWM was written back between on_press and script.stop
+#
+# Layer 5: INTERVAL-BASED SAFETY WATCHDOG (100ms)
+#   - Completely independent of scripts, FSM, and the binary_sensor system
+#   - Runs on the main loop every 100ms
+#   - If motion_dir is non-zero AND the relevant endstop is active → hardware kill
+#   - This is the ULTIMATE backstop — catches any failure mode in layers 1-4
+#   - Worst case: motor runs 100ms past endstop (vs >1 second in V2)
+#
+# CHANGES IN V2.2  (vs V2.1)
+# =========================
+#
+# CRITICAL SAFETY FIX: Endstop-triggered motor stop was delayed by 3 levels of
+# async script.execute calls (enter_idle_state → motor_stop → apply_pwm).
+# Gate could travel 80-150ms past the endstop before PWM actually reached zero.
+#
+# 1. IMMEDIATE MOTOR KILL ON ENDSTOP
+#    - Endstop on_press handlers now zero BOTH PWM outputs directly via
+#      output.set_level BEFORE sending the FSM input
+#    - Motor stops in the same main loop iteration as endstop detection
+#    - FSM transition happens after (handles state management, not safety)
+#
+# 2. MOTOR_STOP: DIRECT HARDWARE ACCESS
+#    - motor_stop now uses output.set_level directly instead of async apply_pwm
+#    - Eliminates one level of async delay in ALL stop paths
+#
+# 3. ALL SAFETY-CRITICAL STOPS: DIRECT HARDWARE KILL
+#    - Obstacle detection (first hit, reverse hit, FAULT) kills PWM in-lambda
+#    - Movement timeout kills PWM in-lambda before FAULT_CMD
+#    - Pattern: hardware kill first, THEN FSM transition for state management
+#
+# 4. REDUCED SOFT STOP MINIMUM PWM: 0.45 → 0.30
+#    - Gate approaches endstop with significantly less force
+#    - Reduces mechanical impact and momentum carry-through
+#    - Verify your gate still moves reliably at 30% — increase if it stalls
+#
+# CHANGES IN V2.1  (vs V2)
+# =========================
+#
+# 1. MOVEMENT TIMEOUT SAFETY
+#    - New movement_timeout script triggers FAULT if travel exceeds learned_time * 1.5
+#    - Prevents indefinite motor run if endstop fails or gate physically jams
+#    - Launched from motor_start, cancelled by enter_idle_state
+#
+# 2. OBSTACLE DETECTION IMPROVEMENTS
+#    - 300ms grace period after motor start to avoid inrush current false positives
+#    - Reduced endstop threshold multiplier from 1.30× to 1.15× (err on side of detection)
+#    - Obstacle state (retry_armed, reversing) preserved across pauses
+#      (user pausing during obstacle reverse no longer resets retry escalation)
+#    - Explicit skip during soft start ramp (PWM < 50% = unreliable current readings)
+#
+# 3. CYCLE FROM PAUSED_FROM_CLOSING → OPENING (not OPENING_CYCLE)
+#    - Removes surprise auto-close when user manually reverses from a closing pause
+#    - Now symmetric: both pause states resume to non-auto-close motion
+#
+# 4. POSITION TRACKING PUBLISH FIX
+#    - publish_counter moved from static local to proper global variable
+#    - Prevents counter persistence across script restarts causing missed publishes
+#
+# 5. FALLBACK TIME WARNINGS
+#    - Logs WARNING when using fallback travel times (timing not yet learned)
+#    - Makes it obvious in logs that position accuracy may be degraded
+#
+# 6. CODE CLEANUP
+#    - Renamed unclear 'dominated' variable to 'timing_just_armed'
+#    - cancel_auto_close changed from mode:single to mode:restart (idempotent safety)
+#    - Minor formatting and comment improvements
+#
+# FEATURES
+# ========
+#
+# 1. TIMING LEARNING
+#    - Automatically measures full travel time on first endstop-to-endstop run
+#    - Only arms timing when: (a) no learned time exists, AND (b) starting from endstop
+#    - Learned times persist across reboots (restore_value: yes)
+#    - Used for position estimation and soft start/stop calculations
+#    - Can be reset via "Reset Learned Times" button
+#
+# 2. SOFT START
+#    - Ramps PWM from 20% to 100% over first 10% of travel
+#    - Reduces mechanical stress on gate and motor
+#    - DISABLED during timing learning runs (needs consistent speed for accurate measurement)
+#    - Runs in dedicated script with 25ms update interval
+#
+# 3. SOFT STOP
+#    - Ramps PWM from 100% down to 45% in last 5% before destination
+#    - Works for both endstop targets AND position targets
+#    - Reduces impact when stopping at any position
+#    - 25ms update interval for smooth deceleration
+#
+# 4. POSITION TRACKING
+#    - Estimates gate position based on elapsed time vs learned/fallback travel time
+#    - Updates every 25ms while moving
+#    - Publishes to cover component for Home Assistant display
+#    - Resets to 0% or 100% when endstops are hit (ground truth)
+#
+# 5. POSITION CONTROL
+#    - Move gate to any position via Home Assistant cover slider
+#    - Uses move_to_position script which sets position_target and triggers FSM
+#    - position_tracking monitors progress and triggers STOP when target reached
+#    - 2% deadband prevents hunting
+#    - Soft start/stop work normally for position moves
+#
+# 6. AUTO-CLOSE
+#    - When opening via CYCLE from CLOSED, arms auto-close countdown
+#    - Countdown duration pulled from Home Assistant input_number entity
+#    - Countdown only ticks while gate is at OPEN endstop (OPEN_CYCLE state)
+#    - Pressing CYCLE while countdown active cancels it (transitions to OPEN)
+#    - Cancelled automatically if gate moves or stops mid-travel
+#
+# 7. ONE-BUTTON (CYCLE) CONTROL
+#    - CLOSED → OPENING_CYCLE (with auto-close armed)
+#    - OPEN_CYCLE + countdown active → OPEN (cancel countdown)
+#    - OPEN → CLOSING
+#    - OPENING/OPENING_CYCLE → PAUSED_FROM_OPENING
+#    - CLOSING → PAUSED_FROM_CLOSING
+#    - PAUSED_FROM_OPENING → CLOSING
+#    - PAUSED_FROM_CLOSING → OPENING (auto-close rearms)
+#
+# 8. OBSTACLE DETECTION
+#    - Monitors motor current via INA260 while moving
+#    - Threshold adjustable via Home Assistant number entity
+#    - Threshold increased 15% near endstops (0-10% and 90-100%)
+#    - 300ms grace period after motor start (avoids inrush false positives)
+#    - Skipped while soft start is ramping (current unreliable at low PWM)
+#    - First hit: reverses by configurable distance (default 15%)
+#    - Second hit during reverse: FAULT state (hard stop)
+#    - Disabled during timing learning runs
+#
+# 9. MOVEMENT TIMEOUT (NEW in V2.1)
+#    - Watchdog timer based on learned travel time × 1.5
+#    - Triggers FAULT_CMD if gate hasn't reached destination
+#    - Protects against stuck endstops, mechanical jams, or belt slip
+#    - Automatically cancelled when motion stops normally
+#
+# 10. HOLD-TO-OPERATE / JOG MODE
+#     - OPEN and CLOSE buttons use dead man's switch pattern
+#     - BYPASSES FSM entirely — direct PWM motor control at 70% speed
+#     - Motor runs only while button is physically held down
+#     - Endstop lockout: refuses to start if already at limit in that direction
+#     - Stops any running FSM scripts to prevent PWM interference
+#     - 150ms H-bridge dead time when reversing direction
+#     - Basic position tracking runs during jog (50ms updates)
+#     - If jog hits endstop: endstop handler fires, syncs FSM state automatically
+#     - If jog stops mid-travel: FSM stays in prior state, Cycle resumes normal ops
+#
+# 11. CONTROL PANEL
+#     - Standalone operation without PC/phone interface
+#     - 5 buttons: Cycle, Open (hold), Close (hold), Stop, Reboot/Reset
+#     - 7 LEDs: Open endstop, Closed endstop, Opening, Closing, Auto-close, Fault, Stop
+#     - Power LED hardwired to 3.3V (always on when powered)
+#     - LED state updated every 250ms via polling interval
+#     - Fault LED flashes at 2Hz while in FAULT state
+#     - Reboot/Reset button: 3s hold = reboot, 10s hold = reset times + reboot
+#
+# GLOBALS REFERENCE
+# =================
+#
+# Position Control:
+#   position_target     - Target position to stop at (-1.0 = no target, move to endstop)
+#
+# PWM Control:
+#   pwm_level           - Current PWM level being applied
+#   soft_start_active   - Flag: soft start ramp in progress
+#   soft_stop_active    - Flag: soft stop ramp in progress
+#   motion_dir          - Motor direction: 1 = opening, -1 = closing, 0 = stopped
+#
+# Position Tracking:
+#   gate_pos            - Current estimated position (0.0-1.0)
+#   move_start_ms       - Timestamp when current motion started
+#   move_start_pos      - Position when current motion started
+#   publish_counter     - Throttle counter for cover position publishes
+#
+# Timing Learning:
+#   measured_open_time  - Learned full-open travel time (seconds)
+#   measured_close_time - Learned full-close travel time (seconds)
+#   operation_start_time- Timestamp for timing measurement
+#   timing_armed        - Flag: currently in a timing learning run
+#   open_time_fallback  - Default open time if not yet learned
+#   close_time_fallback - Default close time if not yet learned
+#
+# Auto-Close:
+#   auto_close_active   - Flag: countdown is running
+#   gate_close_countdown- Seconds remaining in countdown
+#
+# Obstacle Detection:
+#   obstacle_current_threshold - Current threshold for obstacle detection (amps)
+#   obstacle_reverse_distance  - How far to reverse on obstacle (0.0-1.0)
+#   obstacle_retry_armed       - Flag: first obstacle hit, watching for second
+#   obstacle_reverse_target    - Target position for obstacle reverse maneuver
+#   obstacle_reversing         - Flag: currently reversing from obstacle
+#   obstacle_grace_remaining   - Countdown ms for post-start grace period
+#
+# Panel Controls:
+#   reboot_btn_press_ms - Timestamp when reboot/reset button was pressed
+#   fault_led_state     - Toggle state for fault LED flashing
+#
+# SCRIPTS REFERENCE
+# =================
+#
+# Motor Control:
+#   motor_stop      - Stops motor, clears soft start/stop flags, zeros PWM
+#   motor_start     - Starts motor with soft start (unless timing), launches scripts
+#   apply_pwm       - Applies current pwm_level to correct direction output
+#
+# PWM Ramping:
+#   soft_start_ramp - While loop: ramps PWM 20%→100% over 10% travel, 25ms updates
+#   soft_stop_ramp  - While loop: monitors position, decelerates before destination, 25ms
+#                    Position targets: 5% ramp zone, min 30% PWM (gentle stop)
+#                    Endstop approaches: 1% ramp zone, min 45% PWM (switch does final stop)
+#
+# Position:
+#   position_tracking - While loop: calculates position from time, checks target, 25ms
+#   move_to_position  - Sets position_target and triggers appropriate FSM input
+#
+# Initialization:
+#   check_initial_state - On boot: checks endstops, sends appropriate FSM input
+#   enter_idle_state    - Handles all motor shutdown, clears flags, publishes IDLE
+#
+# Auto-Close:
+#   auto_close_countdown - Gets duration from HA, counts down, triggers CLOSE_CMD
+#   cancel_auto_close    - Clears auto-close state
+#
+# Safety:
+#   obstacle_monitor     - Monitors current, triggers reverse or FAULT
+#   clear_obstacle_state - Clears obstacle flags
+#   movement_timeout     - Watchdog: FAULT if motion exceeds expected time × 1.5
+#
+# Jog Control:
+#   jog_open             - Direct motor open while button held (bypasses FSM)
+#   jog_close            - Direct motor close while button held (bypasses FSM)
+#
+# Intervals:
+#   100ms - Endstop safety watchdog (kills motor if endstop active during motion)
+#   250ms - Panel LED update (reads state, drives all 7 LEDs)
+#
+# HOME ASSISTANT INTEGRATION
+# ==========================
+#
+# Entities Exposed:
+#   - cover.gate (with position control)
+#   - sensor.gate_control_v2_state (FSM state)
+#   - sensor.gate_control_v2_gate_position
+#   - sensor.gate_control_v2_learned_open_time
+#   - sensor.gate_control_v2_learned_close_time
+#   - sensor.gate_control_v2_close_countdown
+#   - sensor.gate_control_v2_pwm_level
+#   - sensor.gate_motor_current
+#   - binary_sensor.gate_open_endstop
+#   - binary_sensor.gate_close_endstop
+#   - binary_sensor.gate_control_v2_auto_close_armed
+#   - button.gate_control_v2_reset_learned_times
+#   - button.gate_control_v2_gate_cycle
+#   - number.gate_control_v2_obstacle_threshold
+#   - number.gate_control_v2_obstacle_reverse_distance
+#
+# Required HA Entity:
+#   - input_number.entry_gate_duration (auto-close countdown duration in seconds)
+#
+# TROUBLESHOOTING
+# ===============
+#
+# Gate doesn't move:
+#   - Check FSM state in logs or text sensor
+#   - Verify endstop sensors are working (check binary_sensor states)
+#   - Check motor_start logs for PWM output
+#
+# Position tracking inaccurate:
+#   - Reset learned times and do a full endstop-to-endstop run
+#   - Look for "FALLBACK" warnings in logs (timing not learned yet)
+#   - Ensure fallback times are reasonable for your gate
+#   - Position resets to ground truth at endstops
+#
+# Soft start/stop not working:
+#   - During timing runs, soft start is intentionally disabled
+#   - Check soft_start_active / soft_stop_active in logs
+#   - Verify PWM level sensor shows ramping values
+#   - For position moves, soft_stop uses position_target as destination
+#
+# Position control not stopping:
+#   - Check position_target value in logs
+#   - Verify position_tracking is running (check logs)
+#   - Ensure learned times are accurate (affects position calculation)
+#
+# Auto-close not triggering:
+#   - Verify input_number.entry_gate_duration exists in HA
+#   - Check auto_close_active binary sensor
+#   - Countdown only ticks while in OPEN_CYCLE state at endstop
+#   - Any manual intervention cancels auto-close
+#
+# Obstacle detection issues:
+#   - Check current sensor readings during movement
+#   - Adjust threshold via number entity
+#   - Threshold is 15% higher near endstops (normal mechanical resistance)
+#   - 300ms grace period after motor start (avoids inrush false positives)
+#   - Skipped during soft start ramp (current unreliable at low PWM)
+#   - Disabled during timing learning runs
+#
+# Movement timeout:
+#   - Triggers FAULT if travel time > learned_time × 1.5
+#   - Check for mechanical obstruction, belt slip, or failed endstop
+#   - Clear fault with CYCLE (then CYCLE again to move) or OPEN/CLOSE twice
+#
+#############################################################################################
+
+substitutions:
+  device_name: gate-control-v2               # Used by esp_common.yaml
+  device_description: "FSM-based gate controller with obstacle detection"
+  name_no_dashes: gate_control_v2
+  friendly_name: Gate Control V2
+  restore_mode_setting: RESTORE_DEFAULT_OFF
+  open_pin: GPIO16      # PWM output for opening motor direction
+  close_pin: GPIO17     # PWM output for closing motor direction
+  i2c_sda: GPIO21       # I2C data line for MCP23017 and INA260
+  i2c_scl: GPIO22       # I2C clock line
+
+#############################################################################################
+# ESPHOME CORE CONFIGURATION
+#############################################################################################
+# esp_common.yaml provides: esphome (name, comment, friendly_name),
+#   logger, api (reboot_timeout:0s), ota, wifi, captive_portal, web_server, time,
+#   status binary_sensor, wifi/uptime sensors, version/wifi text_sensors, restart switch
+# wemos_d1_mini32.yaml provides: board config, status LED (output, light, effects,
+#   update_status_led script, connectivity callbacks, on_boot)
+# We only specify gate-specific additions/overrides below.
+#############################################################################################
+
+esphome:
+  compile_process_limit: 1
+  on_boot:                                    # Merges with hardware package's on_boot (update_status_led)
+    then:
+      - script.execute: check_initial_state
+
+packages:
+  - !include /config/esphome/common/esp_common.yaml
+  - !include /config/esphome/common/wemos_d1_mini32.yaml
+
+#############################################################################################
+# EXTERNAL COMPONENTS
+#############################################################################################
+
+external_components:
+  # FSM component from muxa - enables finite state machine functionality
+  - source:
+      type: git
+      url: https://github.com/muxa/esphome-state-machine
+      ref: main
+    components: [state_machine]
+    refresh: 1d
+
+#############################################################################################
+# NETWORK OVERRIDES (gate-specific additions to esp_common defaults)
+#############################################################################################
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  password: !secret ota_password
+
+web_server:
+  version: 2
+
+#############################################################################################
+# ENDSTOP SAFETY WATCHDOG (runs independently of FSM and scripts)
+#############################################################################################
+# This is the ULTIMATE BACKSTOP. It runs every 100ms on the main loop, completely
+# independent of scripts, FSM state, or any other logic. If an endstop is active
+# while the motor is driving toward it, the motor is killed immediately.
+#
+# This catches the failure mode where on_press (edge-triggered) fires and kills PWM,
+# but a still-running script writes PWM back before it exits its while-loop iteration.
+# The interval will catch it on the next 100ms tick and kill it again.
+#############################################################################################
+
+interval:
+  #-----------------------------------------------------------------------------------------
+  # ENDSTOP SAFETY WATCHDOG - 100ms (runs independently of everything)
+  #-----------------------------------------------------------------------------------------
+  - interval: 100ms
+    then:
+      - lambda: |-
+          // Only check when motor is supposed to be running
+          const int dir = id(motion_dir);
+          if (dir == 0) return;
+          
+          bool endstop_violation = false;
+          
+          if (dir == 1 && id(gate_open_switch).state) {
+            endstop_violation = true;
+          } else if (dir == -1 && id(gate_close_switch).state) {
+            endstop_violation = true;
+          }
+          
+          if (endstop_violation) {
+            // Check if PWM is actually non-zero (real danger)
+            const float pwm = id(pwm_level);
+            if (pwm > 0.001f) {
+              ESP_LOGE("WATCHDOG", 
+                      "ENDSTOP ACTIVE (dir=%d) WITH PWM=%.0f%% - EMERGENCY KILL",
+                      dir, pwm * 100);
+            }
+            // Kill regardless (even if pwm_level reads 0, hardware might disagree)
+            id(motor_kill) = true;
+            id(pwm_level) = 0.0f;
+            id(gate_control_gate_open).set_level(0.0f);
+            id(gate_control_gate_close).set_level(0.0f);
+          }
+
+  #-----------------------------------------------------------------------------------------
+  # PANEL LED UPDATE - 250ms
+  # Reads FSM state + sensor state and drives all panel LEDs.
+  # Runs independently of FSM/scripts for maximum reliability.
+  #
+  # LED behaviors:
+  #   Endstop LEDs:   follow physical switch state (solid green)
+  #   Direction LEDs: on while moving in that direction (solid amber)
+  #   Auto-close LED: 1Hz flash while countdown active, off otherwise
+  #   Fault LED:      2Hz flash while in FAULT state
+  #   Stop LED:       on when gate stopped mid-travel (IDLE state)
+  #-----------------------------------------------------------------------------------------
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const std::string st = id(gate_fsm_state_text).state;
+          
+          // Endstop LEDs: follow physical switch state
+          id(led_open_endstop).set_state(id(gate_open_switch).state);
+          id(led_closed_endstop).set_state(id(gate_close_switch).state);
+          
+          // Direction LEDs: on while moving (FSM motion OR jog mode)
+          const bool opening = (st == "OPENING" || st == "OPENING_CYCLE" || id(motion_dir) == 1);
+          const bool closing = (st == "CLOSING" || id(motion_dir) == -1);
+          id(led_opening).set_state(opening);
+          id(led_closing).set_state(closing);
+          
+          // Auto-close LED: 1Hz flash while countdown active
+          // 250ms interval → toggle every 2 ticks = 500ms on / 500ms off = 1Hz
+          if (id(auto_close_active)) {
+            id(auto_close_flash_counter)++;
+            if (id(auto_close_flash_counter) >= 2) {
+              id(auto_close_flash_counter) = 0;
+            }
+            id(led_auto_close).set_state(id(auto_close_flash_counter) == 0);
+          } else {
+            id(auto_close_flash_counter) = 0;
+            id(led_auto_close).set_state(false);
+          }
+          
+          // Fault LED: 2Hz flash (toggle each 250ms tick) while in FAULT
+          if (st == "FAULT") {
+            id(fault_led_state) = !id(fault_led_state);
+            id(led_fault).set_state(id(fault_led_state));
+          } else {
+            id(fault_led_state) = false;
+            id(led_fault).set_state(false);
+          }
+          
+          // Stop LED: on when gate stopped mid-travel (IDLE = stopped, not at endstop)
+          id(led_stop).set_state(st == "IDLE");
+
+#############################################################################################
+# I2C BUS CONFIGURATION
+#############################################################################################
+
+i2c:
+  sda: ${i2c_sda}
+  scl: ${i2c_scl}
+  scan: true
+  frequency: 10khz
+
+#############################################################################################
+# GPIO EXPANDER
+#############################################################################################
+
+mcp23017:
+  - id: gate_io_expander
+    address: 0x20
+
+#############################################################################################
+# GLOBALS (STATE VARIABLES)
+#############################################################################################
+
+globals:
+  #-----------------------------------------------------------------------------------------
+  # SAFETY INTERLOCK
+  #-----------------------------------------------------------------------------------------
+
+  # Software kill switch - when true, apply_pwm ALWAYS writes zero
+  # Set by endstop handlers, cleared only by motor_start
+  # This prevents any running script from reactivating the motor after a stop
+  - id: motor_kill
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  #-----------------------------------------------------------------------------------------
+  # PWM CONTROL AND MOTOR DIRECTION
+  #-----------------------------------------------------------------------------------------
+
+  # Target position for stop (-1.0 = no target, move to endstop)
+  - id: position_target
+    type: float
+    restore_value: no
+    initial_value: "-1.0"
+
+  # Motor direction: 1 = opening, -1 = closing, 0 = stopped
+  - id: motion_dir
+    type: int
+    restore_value: no
+    initial_value: "0"
+  
+  # Current PWM level being applied (changes during soft start/stop)
+  - id: pwm_level
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+    
+  # Flag: soft start ramp is currently in progress
+  - id: soft_start_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Flag: soft stop ramp is currently active
+  - id: soft_stop_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  #-----------------------------------------------------------------------------------------
+  # POSITION TRACKING
+  #-----------------------------------------------------------------------------------------
+  
+  # Current estimated gate position (0.0 = closed, 1.0 = open)
+  - id: gate_pos
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # Timestamp (millis) when current motion started
+  - id: move_start_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  # Position when current motion started (for calculating delta)
+  - id: move_start_pos
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # Throttle counter for cover position publishes (replaces static local)
+  - id: publish_counter
+    type: uint8_t
+    restore_value: no
+    initial_value: "0"
+
+  #-----------------------------------------------------------------------------------------
+  # TIMING LEARNING
+  #-----------------------------------------------------------------------------------------
+  
+  # Learned time for full open travel (seconds). 0.0 = not yet learned
+  - id: measured_open_time
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # Learned time for full close travel (seconds)
+  - id: measured_close_time
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # Timestamp when timing measurement started
+  - id: operation_start_time
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+    
+  # Flag: currently in a timing learning run
+  - id: timing_armed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  #-----------------------------------------------------------------------------------------
+  # AUTO-CLOSE
+  #-----------------------------------------------------------------------------------------
+  
+  # Flag: auto-close countdown is active
+  - id: auto_close_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+    
+  # Seconds remaining in auto-close countdown
+  - id: gate_close_countdown
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  #-----------------------------------------------------------------------------------------
+  # FALLBACK VALUES (used before timing is learned)
+  #-----------------------------------------------------------------------------------------
+  
+  - id: open_time_fallback
+    type: float
+    restore_value: yes
+    initial_value: "50.0"
+
+  - id: close_time_fallback
+    type: float
+    restore_value: yes
+    initial_value: "50.0"
+
+  #-----------------------------------------------------------------------------------------
+  # OBSTACLE DETECTION
+  #-----------------------------------------------------------------------------------------
+  
+  # Base current threshold for obstacle detection (amps)
+  - id: obstacle_current_threshold
+    type: float
+    restore_value: yes
+    initial_value: "0.25"
+
+  # How far to reverse when obstacle detected (0.15 = 15%)
+  - id: obstacle_reverse_distance
+    type: float
+    restore_value: yes
+    initial_value: "0.15"
+
+  # Flag: first obstacle hit, retry armed
+  - id: obstacle_retry_armed
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Target position for reverse maneuver
+  - id: obstacle_reverse_target
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # Flag: currently reversing from obstacle
+  - id: obstacle_reversing
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Grace period remaining after motor start (milliseconds)
+  # Prevents inrush current from triggering false obstacle detection
+  - id: obstacle_grace_remaining
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  #-----------------------------------------------------------------------------------------
+  # PANEL CONTROLS
+  #-----------------------------------------------------------------------------------------
+  
+  # Timestamp when reboot/reset button was pressed (for hold duration)
+  - id: reboot_btn_press_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  # Fault LED toggle state (for flashing)
+  - id: fault_led_state
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Auto-close LED flash counter (1Hz = toggle every 2 ticks at 250ms interval)
+  - id: auto_close_flash_counter
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+#############################################################################################
+# PWM OUTPUTS
+#############################################################################################
+
+output:
+  # PWM output for opening direction (20kHz = above audible range)
+  - platform: ledc
+    pin: ${open_pin}
+    frequency: 20000Hz
+    id: gate_control_gate_open
+
+  # PWM output for closing direction
+  - platform: ledc
+    pin: ${close_pin}
+    frequency: 20000Hz
+    id: gate_control_gate_close
+
+  #-----------------------------------------------------------------------------------------
+  # PANEL LEDs (MCP23017 GPB0-GPB6)
+  #-----------------------------------------------------------------------------------------
+  
+  - platform: gpio
+    id: led_open_endstop
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 8          # GPB0
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_closed_endstop
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 9          # GPB1
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_opening
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 10         # GPB2
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_closing
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 11         # GPB3
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_auto_close
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 12         # GPB4
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_fault
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 13         # GPB5
+      mode: output
+      inverted: false
+
+  - platform: gpio
+    id: led_stop
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 14         # GPB6
+      mode: output
+      inverted: false
+
+#############################################################################################
+# SENSORS
+#############################################################################################
+
+sensor:
+  #-----------------------------------------------------------------------------------------
+  # CURRENT SENSOR - INA260
+  #-----------------------------------------------------------------------------------------
+  - platform: ina260
+    address: 0x40
+    id: gate_power_sensor
+    update_interval: never
+    current:
+      id: gate_power_sensor_current
+      name: "Gate Motor Current"
+      accuracy_decimals: 2
+      filters:
+        - sliding_window_moving_average:
+            window_size: 10
+            send_every: 1
+
+  #-----------------------------------------------------------------------------------------
+  # DIAGNOSTIC SENSORS
+  #-----------------------------------------------------------------------------------------
+
+  # Current gate position as percentage
+  - platform: template
+    name: "${friendly_name} Gate Position"
+    id: sensor_gate_pos
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:gate"
+    lambda: |-
+      return id(gate_pos) * 100.0f;
+    update_interval: never
+    
+
+  # Timestamps for debugging (internal only)
+  - platform: template
+    name: "${friendly_name} Move Start Time"
+    id: sensor_move_start_ms
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    icon: "mdi:timer-outline"
+    internal: true
+    lambda: |-
+      return (float)id(move_start_ms);
+    update_interval: never
+    
+
+  - platform: template
+    name: "${friendly_name} Move Start Position"
+    id: sensor_move_start_pos
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    icon: "mdi:ray-start"
+    internal: true
+    lambda: |-
+      return id(move_start_pos) * 100.0f;
+    update_interval: never
+    
+
+  # Learned travel times
+  - platform: template
+    name: "${friendly_name} Learned Open Time"
+    id: sensor_measured_open_time
+    unit_of_measurement: "s"
+    accuracy_decimals: 1
+    icon: "mdi:timer-check"
+    lambda: |-
+      return id(measured_open_time);
+    update_interval: never
+
+  - platform: template
+    name: "${friendly_name} Learned Close Time"
+    id: sensor_measured_close_time
+    unit_of_measurement: "s"
+    accuracy_decimals: 1
+    icon: "mdi:timer-check"
+    lambda: |-
+      return id(measured_close_time);
+    update_interval: never
+
+  - platform: template
+    name: "${friendly_name} Operation Start Time"
+    id: sensor_operation_start_time
+    unit_of_measurement: "ms"
+    accuracy_decimals: 0
+    icon: "mdi:timer-start"
+    internal: true
+    lambda: |-
+      return (float)id(operation_start_time);
+    update_interval: never
+
+  # Current PWM duty cycle
+  - platform: template
+    name: "${friendly_name} PWM Level"
+    id: sensor_pwm_level
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: "mdi:pulse"
+    lambda: |-
+      return id(pwm_level) * 100.0f;
+    update_interval: never
+  #-----------------------------------------------------------------------------------------
+  # AUTO-CLOSE SENSORS
+  #-----------------------------------------------------------------------------------------
+
+  # Pulls countdown duration from Home Assistant
+  - platform: homeassistant
+    id: ui_gate_duration
+    entity_id: input_number.entry_gate_duration
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            if (!id(auto_close_active)) {
+              int duration = 20;
+              if (!isnan(x) && x >= 1.0f && x <= 300.0f) {
+                duration = (int)x;
+              }
+              id(gate_close_countdown) = duration;
+              ESP_LOGD("auto_close", "Countdown display set to %d from HA", duration);
+            }
+
+  # Current auto-close countdown value
+  - platform: template
+    name: "${friendly_name} Close Countdown"
+    id: sensor_close_countdown
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    icon: "mdi:timer"
+    lambda: |-
+      return id(gate_close_countdown);
+    update_interval: never
+
+
+  # Current obstacle threshold (adjusted for position)
+  - platform: template
+    name: "${friendly_name} Obstacle Threshold"
+    id: sensor_obstacle_threshold
+    unit_of_measurement: "A"
+    accuracy_decimals: 2
+    icon: "mdi:current-ac"
+    internal: true
+    lambda: |-
+      return id(obstacle_current_threshold);
+    update_interval: never
+ 
+
+#############################################################################################
+# BINARY SENSORS
+#############################################################################################
+
+binary_sensor:
+  #-----------------------------------------------------------------------------------------
+  # PHYSICAL INPUTS - ENDSTOPS
+  #-----------------------------------------------------------------------------------------
+  
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 0
+      mode: 
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_open_switch
+    name: "Gate Open Endstop"
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      - script.execute:
+          id: handle_endstop
+          which: 1
+
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 1
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_close_switch
+    name: "Gate Close Endstop"
+    filters:
+      - delayed_on: 10ms
+    on_press:
+      - script.execute:
+          id: handle_endstop
+          which: -1
+
+  #-----------------------------------------------------------------------------------------
+  # PHYSICAL INPUTS - CONTROL BUTTONS
+  #-----------------------------------------------------------------------------------------
+
+  # CYCLE button - one-button control (momentary press)
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 2
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_cycle_trigger
+    name: "Gate Cycle Trigger"
+    filters:
+      - delayed_on: 80ms
+    on_press:
+      - logger.log: "EVENT: CYCLE button pressed"
+      - button.press: gate_cycle_button
+
+  # OPEN button - HOLD TO OPERATE (jog mode / dead man's switch)
+  # Direct motor control while held - bypasses FSM and all scripts
+  # Stops immediately on release or endstop hit
+  # Blocked if already at open endstop (lockout)
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 3
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_open_cmd_button
+    name: "Gate OPEN Button"
+    filters:
+      - delayed_on: 80ms
+    on_press:
+      - script.execute:
+          id: jog
+          dir: 1   # (or -1 for close button)
+    on_release:
+      - script.stop: jog
+      - script.execute: motor_stop
+      - globals.set:
+          id: motion_dir
+          value: '0'
+
+  # CLOSE button - HOLD TO OPERATE (jog mode / dead man's switch)
+  # Same pattern as OPEN but in close direction
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 4
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_close_cmd_button
+    name: "Gate CLOSE Button"
+    filters:
+      - delayed_on: 80ms
+    on_press:
+      - script.execute:
+          id: jog
+          dir: -1  
+    on_release:
+      - script.execute: motor_stop
+      - globals.set:
+          id: motion_dir
+          value: '0'
+  # STOP button - dedicated emergency stop (big red button)
+  # Kills jog scripts directly AND sends FSM STOP
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 5
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_stop_button
+    name: "Gate STOP Button"
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - logger.log:
+          level: WARN
+          format: "EVENT: STOP button pressed"
+      # Kill jog scripts directly (FSM might not accept STOP from all states)
+      - script.execute: motor_stop
+      - state_machine.transition:
+          id: gate_fsm
+          input: STOP
+
+  # REBOOT / RESET button - hold duration determines action
+  # Short hold (3-9s)  = reboot ESP
+  # Long hold  (10s+)  = reset learned times + reboot
+  # Press < 3s         = ignored (prevents accidental trigger)
+  - platform: gpio
+    pin:
+      mcp23xxx: gate_io_expander
+      number: 6
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: gate_reboot_reset_button
+    name: "Gate Reboot/Reset Button"
+    filters:
+      - delayed_on: 80ms
+    on_press:
+      - lambda: 'id(reboot_btn_press_ms) = millis();'
+      - logger.log: "Reboot/Reset button pressed - hold 3s to reboot, 10s to reset times"
+    on_release:
+      - lambda: |-
+          unsigned long held_ms = millis() - id(reboot_btn_press_ms);
+          float held_s = held_ms / 1000.0f;
+          
+          if (held_s >= 10.0f) {
+            ESP_LOGW("panel", "RESET: Button held %.1fs - resetting learned times + rebooting", held_s);
+            id(measured_open_time) = 0.0f;
+            id(measured_close_time) = 0.0f;
+            // Reboot after short delay to let log flush
+            delay(500);
+            App.safe_reboot();
+          } else if (held_s >= 3.0f) {
+            ESP_LOGW("panel", "REBOOT: Button held %.1fs - rebooting", held_s);
+            delay(500);
+            App.safe_reboot();
+          } else {
+            ESP_LOGI("panel", "Button held %.1fs - too short, ignoring (need 3s+)", held_s);
+          }
+
+  #-----------------------------------------------------------------------------------------
+  # DIAGNOSTIC BINARY SENSORS (internal)
+  #-----------------------------------------------------------------------------------------
+  
+  - platform: template
+    name: "${friendly_name} Timing Armed"
+    id: sensor_timing_armed
+    icon: "mdi:arm-flex"
+    internal: true
+    lambda: |-
+      return id(timing_armed);
+
+  - platform: template
+    id: diag_gate_ajar
+    name: "DIAG Gate Ajar"
+    internal: true
+    lambda: |-
+      return !id(gate_open_switch).state && !id(gate_close_switch).state;
+
+  - platform: template
+    id: diag_motor_opening
+    name: "DIAG Motor Current: Opening"
+    internal: true
+    lambda: |-
+      const float a = id(gate_power_sensor_current).state;
+      return a > 0.05f;
+
+  - platform: template
+    id: diag_motor_closing
+    name: "DIAG Motor Current: Closing"
+    internal: true
+    lambda: |-
+      const float a = id(gate_power_sensor_current).state;
+      return a < -0.05f;
+
+  - platform: template
+    name: "${friendly_name} Soft Start Active"
+    id: sensor_soft_start_active
+    icon: "mdi:rocket-launch"
+    internal: true
+    lambda: |-
+      return id(soft_start_active);
+    
+  - platform: template
+    name: "${friendly_name} Soft Stop Active"
+    id: sensor_soft_stop_active
+    icon: "mdi:car-brake-parking"
+    internal: true
+    lambda: |-
+      return id(soft_stop_active);
+
+  - platform: template
+    name: "${friendly_name} Auto Close Armed"
+    id: sensor_auto_close_active
+    icon: "mdi:timer-lock"
+    lambda: |-
+      return id(auto_close_active);
+
+  - platform: template
+    name: "${friendly_name} Obstacle Retry Armed"
+    id: sensor_obstacle_retry_armed
+    icon: "mdi:alert"
+    internal: true
+    lambda: |-
+      return id(obstacle_retry_armed);
+
+  - platform: template
+    name: "${friendly_name} Obstacle Reversing"
+    id: sensor_obstacle_reversing
+    icon: "mdi:backup-restore"
+    internal: true
+    lambda: |-
+      return id(obstacle_reversing);
+
+#############################################################################################
+# BUTTONS
+#############################################################################################
+
+button:
+  # Clears learned timing data
+  - platform: template
+    name: "${friendly_name} Reset Learned Times"
+    on_press:
+      - globals.set:
+          id: measured_open_time
+          value: '0.0'
+      - globals.set:
+          id: measured_close_time
+          value: '0.0'
+      - logger.log: "Learned times reset to 0"
+      # Force immediate sensor update (normally 5s interval)
+      - script.execute: update_diagnostic_sensors
+
+  #-----------------------------------------------------------------------------------------
+  # GATE CYCLE BUTTON - one-button control
+  #-----------------------------------------------------------------------------------------
+  - platform: template
+    name: "${friendly_name} Gate Cycle"
+    id: gate_cycle_button
+    on_press:
+      - lambda: |-
+          ESP_LOGI("cycle", "CYCLE pressed, state: %s", id(gate_fsm_state_text).state.c_str());
+      - state_machine.transition:
+          id: gate_fsm
+          input: CYCLE
+
+#############################################################################################
+# NUMBER INPUTS
+#############################################################################################
+
+number:
+  # Adjustable obstacle detection threshold
+  - platform: template
+    name: "${friendly_name} Obstacle Threshold"
+    id: num_obstacle_threshold
+    min_value: 0.10
+    max_value: 2.0
+    step: 0.01
+    unit_of_measurement: "A"
+    icon: "mdi:current-ac"
+    optimistic: true
+    initial_value: 0.25
+    restore_value: true
+    set_action:
+      - globals.set:
+          id: obstacle_current_threshold
+          value: !lambda 'return x;'
+      - script.execute: update_diagnostic_sensors
+      - logger.log:
+          format: "Obstacle threshold set to %.2f A"
+          args: ['x']
+
+  # Adjustable reverse distance
+  - platform: template
+    name: "${friendly_name} Obstacle Reverse Distance"
+    id: num_obstacle_reverse_distance
+    min_value: 5
+    max_value: 50
+    step: 5
+    unit_of_measurement: "%"
+    icon: "mdi:backup-restore"
+    optimistic: true
+    initial_value: 15
+    restore_value: true
+    set_action:
+      - globals.set:
+          id: obstacle_reverse_distance
+          value: !lambda 'return x / 100.0f;'
+      - logger.log:
+          format: "Obstacle reverse distance set to %.0f%%"
+          args: ['x']
+
+#############################################################################################
+# TEXT SENSORS
+#############################################################################################
+
+text_sensor:
+  - platform: state_machine
+    name: "${friendly_name} State"
+    id: gate_fsm_state_text
+    state_machine_id: gate_fsm
+
+#############################################################################################
+# FINITE STATE MACHINE
+#############################################################################################
+
+state_machine:
+  - id: gate_fsm
+    name: Gate FSM
+    diagram: mermaid
+    initial_state: STOPPED_UNKNOWN
+
+    #---------------------------------------------------------------------------------------
+    # STATES
+    #---------------------------------------------------------------------------------------
+    states:
+      #-- Boot state: position unknown --
+      - name: STOPPED_UNKNOWN
+        on_enter:
+          - script.execute: enter_idle_state
+
+      #-- Opening without auto-close (OPEN_CMD path) --
+      - name: OPENING
+        on_enter:
+          - globals.set:
+              id: motion_dir
+              value: '1'
+          - script.execute: motor_start
+          - cover.template.publish:
+              id: gate_cover
+              current_operation: OPENING
+
+      #-- Opening with auto-close (CYCLE path) --
+      - name: OPENING_CYCLE
+        on_enter:
+          - logger.log: "OPENING_CYCLE: will auto-close when open"
+          - globals.set:
+              id: motion_dir
+              value: '1'
+          - script.execute: motor_start
+          - cover.template.publish:
+              id: gate_cover
+              current_operation: OPENING
+
+      #-- Fully open, no auto-close --
+      - name: OPEN
+        on_enter:
+          - script.execute: update_diagnostic_sensors
+          - lambda: |-              
+              if (id(timing_armed)) {
+                id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
+                ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
+              }
+              id(gate_pos) = 1.0f;
+          - script.execute: enter_idle_state
+          - cover.template.publish:
+              id: gate_cover
+              position: 1.0
+
+      #-- Fully open with auto-close countdown --
+      - name: OPEN_CYCLE
+        on_enter:
+          - script.execute: update_diagnostic_sensors
+          - lambda: |-
+              if (id(timing_armed)) {
+                id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
+                ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
+              }
+              id(gate_pos) = 1.0f;
+          - script.execute: enter_idle_state
+          - cover.template.publish:
+              id: gate_cover
+              position: 1.0
+          - script.execute: auto_close_countdown
+
+      #-- Closing --
+      - name: CLOSING
+        on_enter:
+          - globals.set:
+              id: motion_dir
+              value: '-1'
+          - script.execute: cancel_auto_close
+          - script.execute: motor_start
+          - cover.template.publish:
+              id: gate_cover
+              current_operation: CLOSING
+
+      #-- Fully closed --
+      - name: CLOSED
+        on_enter:
+          - lambda: |-
+              if (id(timing_armed)) {
+                id(measured_close_time) = (millis() - id(operation_start_time)) / 1000.0f;
+                ESP_LOGI("timing", "Learned CLOSE time: %.1f seconds", id(measured_close_time));
+              }
+              id(gate_pos) = 0.0f;
+          - script.execute: enter_idle_state
+          - cover.template.publish:
+              id: gate_cover
+              position: 0.0
+
+      #-- Paused mid-travel while opening --
+      - name: PAUSED_FROM_OPENING
+        on_enter:
+          - script.execute: enter_idle_state
+
+      #-- Paused mid-travel while closing --
+      - name: PAUSED_FROM_CLOSING
+        on_enter:
+          - script.execute: enter_idle_state
+
+      #-- Explicitly stopped --
+      - name: STOPPED
+        on_enter:
+          - script.execute: enter_idle_state
+
+      #-- Fault state (obstacle, timeout, etc.) --
+      - name: FAULT
+        on_enter:
+          - logger.log:
+              level: ERROR
+              format: "FAULT state entered"
+          - script.execute: enter_idle_state
+
+    #---------------------------------------------------------------------------------------
+    # INPUTS AND TRANSITIONS
+    #---------------------------------------------------------------------------------------
+    inputs:
+      #-- CYCLE: one-button control --
+      - name: CYCLE
+        transitions:
+          - CLOSED -> OPENING_CYCLE
+          - OPEN -> CLOSING
+          - OPEN_CYCLE -> OPEN                   # Cancel countdown, stay open
+          - OPENING -> PAUSED_FROM_OPENING
+          - OPENING_CYCLE -> PAUSED_FROM_OPENING
+          - CLOSING -> PAUSED_FROM_CLOSING
+          - PAUSED_FROM_OPENING -> CLOSING
+          - PAUSED_FROM_CLOSING -> OPENING_CYCLE      
+          - STOPPED -> OPENING_CYCLE
+          - STOPPED_UNKNOWN -> CLOSING
+          - FAULT -> STOPPED
+
+      #-- OPEN_ENDSTOP: physical endstop triggered --
+      - name: OPEN_ENDSTOP
+        transitions:
+          - OPENING -> OPEN
+          - OPENING_CYCLE -> OPEN_CYCLE
+          - STOPPED_UNKNOWN -> OPEN
+
+      #-- CLOSE_ENDSTOP: physical endstop triggered --
+      - name: CLOSE_ENDSTOP
+        transitions:
+          - CLOSING -> CLOSED
+          - STOPPED_UNKNOWN -> CLOSED
+
+      #-- STOP: explicit stop command --
+      - name: STOP
+        transitions: 
+          - OPENING -> STOPPED
+          - OPENING_CYCLE -> STOPPED
+          - CLOSING -> STOPPED
+          - STOPPED_UNKNOWN -> STOPPED
+          - FAULT -> STOPPED
+
+      #-- OPEN_CMD: dedicated open (no auto-close) --
+      - name: OPEN_CMD
+        transitions:
+          - CLOSED -> OPENING
+          - OPEN_CYCLE -> OPEN
+          - OPENING -> PAUSED_FROM_OPENING
+          - OPENING_CYCLE -> PAUSED_FROM_OPENING
+          - CLOSING -> OPENING
+          - PAUSED_FROM_OPENING -> OPENING
+          - PAUSED_FROM_CLOSING -> OPENING
+          - STOPPED_UNKNOWN -> OPENING
+          - FAULT -> STOPPED_UNKNOWN
+          - STOPPED -> OPENING
+
+      #-- CLOSE_CMD: dedicated close --
+      - name: CLOSE_CMD
+        transitions:
+          - OPEN -> CLOSING
+          - OPEN_CYCLE -> CLOSING
+          - OPENING -> CLOSING
+          - OPENING_CYCLE -> CLOSING
+          - CLOSING -> PAUSED_FROM_CLOSING
+          - PAUSED_FROM_CLOSING -> CLOSING
+          - PAUSED_FROM_OPENING -> CLOSING
+          - STOPPED_UNKNOWN -> CLOSING
+          - FAULT -> STOPPED_UNKNOWN
+          - STOPPED -> CLOSING
+
+      #-- FAULT_CMD: trigger fault state --
+      - name: FAULT_CMD
+        transitions:
+          - OPENING -> FAULT
+          - OPENING_CYCLE -> FAULT
+          - CLOSING -> FAULT
+
+#############################################################################################
+# SCRIPTS
+#############################################################################################
+
+script:
+
+  #=========================================================================================
+  # MOTOR CONTROL
+  #=========================================================================================
+
+  - id: handle_endstop
+    mode: single
+    parameters:
+      which: int
+    then:
+      - lambda: |-
+          ESP_LOGW("endstop", "ENDSTOP: %s - emergency motor kill",
+                   which == 1 ? "OPEN" : "CLOSE");
+      - script.execute: motor_stop
+      - lambda: |-
+          if (which == 1) {
+            id(gate_fsm).transition("OPEN_ENDSTOP");
+          } else {
+            id(gate_fsm).transition("CLOSE_ENDSTOP");
+          }
+
+
+  #-----------------------------------------------------------------------------------------
+  # motor_stop - Immediately stops motor and clears motion flags
+  # Sets hardware PWM DIRECTLY (no async script.execute chain)
+  #-----------------------------------------------------------------------------------------
+  - id: motor_stop
+    mode: restart
+    then:
+      - globals.set:
+          id: motor_kill
+          value: 'true'
+      - globals.set:
+          id: soft_start_active
+          value: 'false'
+      - globals.set:
+          id: soft_stop_active
+          value: 'false'
+      - globals.set:
+          id: pwm_level
+          value: '0.0'
+      # DIRECT hardware kill
+      - output.set_level:
+          id: gate_control_gate_open
+          level: 0.0
+      - output.set_level:
+          id: gate_control_gate_close
+          level: 0.0
+      # Stop all scripts that could write PWM or depend on motor running
+      - script.stop: soft_start_ramp
+      - script.stop: soft_stop_ramp
+      - script.stop: position_tracking
+      - script.stop: obstacle_monitor
+      - script.stop: movement_timeout
+  #-----------------------------------------------------------------------------------------
+  # motor_start - Starts motor with appropriate PWM strategy
+  # - 150ms dead time for H-bridge safety
+  # - Arms timing learning if conditions met
+  # - Sets up soft start or full power (timing run)
+  # - Launches all monitoring scripts + safety timeout
+  #-----------------------------------------------------------------------------------------
+  - id: motor_start
+    mode: restart
+    then:
+      - script.execute: motor_stop
+      - delay: 150ms
+      # Clear the safety interlock - we're intentionally starting motion
+      - globals.set:
+          id: motor_kill
+          value: 'false'
+      - lambda: |-
+          // Position tracking setup
+          id(move_start_ms) = millis();
+          id(move_start_pos) = id(gate_pos);
+          id(publish_counter) = 0;  // Reset publish throttle
+          
+          // Timing arm logic
+          bool timing_just_armed = false;
+          if (id(motion_dir) == 1) {
+            // Opening: arm if no learned time AND starting from closed endstop
+            if (id(measured_open_time) < 1.0f && id(gate_close_switch).state) {
+              id(operation_start_time) = millis();
+              id(timing_armed) = true;
+              timing_just_armed = true;
+              ESP_LOGI("timing", "OPEN timing armed - learning run");
+            }
+          } else if (id(motion_dir) == -1) {
+            // Closing: arm if no learned time AND starting from open endstop
+            if (id(measured_close_time) < 1.0f && id(gate_open_switch).state) {
+              id(operation_start_time) = millis();
+              id(timing_armed) = true;
+              timing_just_armed = true;
+              ESP_LOGI("timing", "CLOSE timing armed - learning run");
+            }
+          }
+          if (!timing_just_armed) {
+            id(timing_armed) = false;
+          }
+          
+          // PWM setup: full power for timing runs, soft start otherwise
+          if (id(timing_armed)) {
+            id(pwm_level) = 1.0f;
+            id(soft_start_active) = false;
+          } else {
+            id(pwm_level) = 0.3f;
+            id(soft_start_active) = true;
+          }
+          
+          // Obstacle detection grace period (300ms for inrush current to settle)
+          id(obstacle_grace_remaining) = 300;
+          
+          // Log fallback warning if timing not yet learned
+          const float eps = 0.001f;
+          if (id(motion_dir) == 1 && id(measured_open_time) < eps) {
+            ESP_LOGW("timing", "FALLBACK: Using default open time (%.0fs) - position may be inaccurate", 
+                     id(open_time_fallback));
+          } else if (id(motion_dir) == -1 && id(measured_close_time) < eps) {
+            ESP_LOGW("timing", "FALLBACK: Using default close time (%.0fs) - position may be inaccurate", 
+                     id(close_time_fallback));
+          }
+      - script.execute: update_diagnostic_sensors
+      - script.execute: apply_pwm
+      - script.execute: position_tracking
+      - script.execute: obstacle_monitor
+      - script.execute: movement_timeout
+      - if:
+          condition:
+            lambda: 'return !id(timing_armed);'
+          then:
+            - script.execute: soft_stop_ramp
+      - if:
+          condition:
+            lambda: 'return id(soft_start_active);'
+          then:
+            - script.execute: soft_start_ramp
+
+  #-----------------------------------------------------------------------------------------
+  # apply_pwm - Routes PWM level to the correct direction output
+  # SAFETY: Checks motor_kill flag. If set, ALWAYS writes zero regardless of pwm_level.
+  # This is the last line of defense against runaway motor.
+  #-----------------------------------------------------------------------------------------
+  - id: apply_pwm
+    mode: restart
+    then:
+      - lambda: |-
+          // SAFETY INTERLOCK: if motor_kill is set, refuse to write any non-zero PWM
+          if (id(motor_kill)) {
+            id(gate_control_gate_open).set_level(0.0f);
+            id(gate_control_gate_close).set_level(0.0f);
+            id(pwm_level) = 0.0f;
+            return;
+          }
+          
+          const float level = id(pwm_level);
+          if (id(motion_dir) == 1) {
+            id(gate_control_gate_open).set_level(level);
+            id(gate_control_gate_close).set_level(0.0f);
+          } else if (id(motion_dir) == -1) {
+            id(gate_control_gate_close).set_level(level);
+            id(gate_control_gate_open).set_level(0.0f);
+          } else {
+            // motion_dir == 0: stopped — zero everything
+            id(gate_control_gate_open).set_level(0.0f);
+            id(gate_control_gate_close).set_level(0.0f);
+          }
+      - script.execute: update_diagnostic_sensors
+
+
+  #=========================================================================================
+  # IDLE STATE / SHUTDOWN
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # enter_idle_state - Master shutdown: stops motor, clears flags, publishes IDLE
+  # NOTE: Obstacle state is preserved during active obstacle handling (obstacle_reversing)
+  #       to maintain retry escalation across pauses
+  #-----------------------------------------------------------------------------------------
+  - id: enter_idle_state
+    mode: restart
+    then:
+      - script.execute: motor_stop
+      - script.execute: update_diagnostic_sensors
+      - script.stop: jog
+      - lambda: |-
+          if (!id(obstacle_reversing)) {
+            if (id(obstacle_retry_armed)) {
+              ESP_LOGI("obstacle", "Clearing obstacle state (normal idle)");
+            }
+            id(obstacle_retry_armed) = false;
+            id(obstacle_reversing) = false;
+            id(obstacle_reverse_target) = 0.0f;
+          } else {
+            ESP_LOGI("obstacle", "Preserving obstacle state during active reversal");
+          }
+      - globals.set:
+          id: timing_armed
+          value: 'false'
+      - globals.set:
+          id: motion_dir
+          value: '0'
+      - globals.set:
+          id: position_target
+          value: '-1.0'
+      - cover.template.publish:
+          id: gate_cover
+          current_operation: IDLE
+      - delay: 1s
+      - repeat:
+          count: 10
+          then:
+            - script.execute: update_diagnostic_sensors
+
+
+  #=========================================================================================
+  # PWM RAMPING
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # soft_start_ramp - Ramps PWM from 20% to 100% over first 10% of travel
+  # Hands off to soft_stop_ramp early if approaching destination
+  #-----------------------------------------------------------------------------------------
+  - id: soft_start_ramp
+    mode: restart
+    then:
+      - logger.log: "Soft start ramp beginning"
+      - while:
+          condition:
+            lambda: 'return id(soft_start_active) && !id(motor_kill);'
+          then:
+            - lambda: |-
+                // SAFETY: Level-triggered endstop check (backup for edge-triggered on_press)
+                if ((id(motion_dir) == 1 && id(gate_open_switch).state) ||
+                    (id(motion_dir) == -1 && id(gate_close_switch).state)) {
+                  ESP_LOGE("safety", "SOFT_START: Endstop active while moving! Killing motor.");
+                  id(motor_kill) = true;
+                  id(gate_control_gate_open).set_level(0.0f);
+                  id(gate_control_gate_close).set_level(0.0f);
+                  id(soft_start_active) = false;
+                  return;
+                }
+                
+                const std::string st = id(gate_fsm_state_text).state;
+                const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
+                const bool closing = (st == "CLOSING");
+                
+                if (!opening && !closing) {
+                  id(soft_start_active) = false;
+                  return;
+                }
+                
+                const float soft_start_zone = 0.10f;  // 10% of full travel
+                
+                const float target = id(position_target);
+                const bool has_target = (target >= 0.0f);
+                const float destination = has_target
+                  ? target 
+                  : (opening ? 1.0f : 0.0f);
+                
+                // Handoff threshold matches soft_stop ramp zone
+                const float soft_stop_zone = has_target ? 0.05f : 0.01f;
+                
+                const float distance_remaining = fabsf(destination - id(gate_pos));
+                const float travel_progress = fabsf(id(gate_pos) - id(move_start_pos));
+                
+                // Hand off to soft stop if close to destination
+                if (distance_remaining <= soft_stop_zone) {
+                  id(soft_start_active) = false;
+                  ESP_LOGI("soft_start", "Handoff to soft_stop at %.1f%% (%.1f%% remaining)", 
+                           id(gate_pos) * 100, distance_remaining * 100);
+                  return;
+                }
+                
+                // Normal ramp completion
+                if (travel_progress >= soft_start_zone) {
+                  id(pwm_level) = 1.0f;
+                  id(soft_start_active) = false;
+                  ESP_LOGI("soft_start", "Ramp complete at %.1f%% travel", travel_progress * 100);
+                } else {
+                  float ramp_progress = travel_progress / soft_start_zone;
+                  id(pwm_level) = 0.2f + 0.8f * ramp_progress;
+                }
+            - script.execute: apply_pwm
+            - delay: 25ms
+      - logger.log: "Soft start ramp ended"
+
+  #-----------------------------------------------------------------------------------------
+  # soft_stop_ramp - Decelerates before destination
+  # Position targets: 5% ramp zone, ramps down to 30% PWM, stops at 0.5% threshold
+  # Endstop approaches: 1% ramp zone, ramps down to 45% PWM (physical switch does final stop)
+  # DISABLED during timing learning runs (needs constant speed for accurate measurement)
+  #-----------------------------------------------------------------------------------------
+  - id: soft_stop_ramp
+    mode: restart
+    then:
+      - logger.log: "Soft stop monitoring started"
+      - while:
+          condition:
+            lambda: |-
+              if (id(motor_kill)) return false;
+              if (id(timing_armed)) return false;  // Never soft-stop during learning runs
+              const std::string st = id(gate_fsm_state_text).state;
+              return (st == "OPENING") || (st == "OPENING_CYCLE") || (st == "CLOSING");
+          then:
+            - lambda: |-
+                // SAFETY: Level-triggered endstop check
+                if ((id(motion_dir) == 1 && id(gate_open_switch).state) ||
+                    (id(motion_dir) == -1 && id(gate_close_switch).state)) {
+                  ESP_LOGE("safety", "SOFT_STOP: Endstop active while moving! Killing motor.");
+                  id(motor_kill) = true;
+                  id(gate_control_gate_open).set_level(0.0f);
+                  id(gate_control_gate_close).set_level(0.0f);
+                  id(pwm_level) = 0.0f;
+                  return;
+                }
+                
+                const std::string st = id(gate_fsm_state_text).state;
+                const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
+                const bool closing = (st == "CLOSING");
+                
+                if (!opening && !closing) return;
+                
+                const float pos = id(gate_pos);
+                const float target = id(position_target);
+                const bool has_target = (target >= 0.0f);
+                
+                const float destination = has_target ? target : (opening ? 1.0f : 0.0f);
+                const float distance_remaining = fabsf(destination - pos);
+                
+                // Position targets need wider ramp zone for gentle deceleration
+                // (no physical switch to absorb impact, must stop on position alone)
+                // Endstop approaches use narrow zone (physical switch does the stopping)
+                const float ramp_zone = has_target ? 0.05f : 0.01f;   // 5% position / 1% endstop
+                const float stop_zone = 0.005f;                        // 0.5% stop threshold
+                const float min_pwm = has_target ? 0.30f : 0.45f;     // 30% position / 45% endstop
+                
+                // Enter soft stop zone
+                if (distance_remaining <= ramp_zone && !id(soft_stop_active)) {
+                  id(soft_stop_active) = true;
+                  ESP_LOGI("soft_stop", "Entering zone at %.1f%% (dest: %.1f%%)", 
+                           pos * 100, destination * 100);
+                }
+                
+                // Ramp down PWM
+                if (id(soft_stop_active)) {
+                  float ramp_progress = 1.0f - (distance_remaining / ramp_zone);
+                  if (ramp_progress > 1.0f) ramp_progress = 1.0f;
+                  float p = 1.0f - (1.0f - min_pwm) * ramp_progress;
+                  if (p < min_pwm) p = min_pwm;
+                  id(pwm_level) = p;
+                }
+                
+                // Position target reached: stop
+                if (has_target && distance_remaining <= stop_zone) {
+                  ESP_LOGI("soft_stop", "Position target reached: %.1f%%", pos * 100);
+                  id(position_target) = -1.0f;
+                  id(gate_fsm).transition("STOP");
+                }
+            - script.execute: apply_pwm
+            - delay: 25ms
+      - logger.log: "Soft stop monitoring stopped"
+
+  #=========================================================================================
+  # POSITION TRACKING
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # position_tracking - Calculates gate position from elapsed time vs travel time
+  # Publishes to cover every 4th cycle (~100ms) to reduce bus traffic
+  #-----------------------------------------------------------------------------------------
+  - id: position_tracking
+    mode: restart
+    then:
+      - logger.log: "Position tracking started"
+      - while:
+          condition:
+            lambda: |-
+              if (id(motor_kill)) return false;
+              const std::string st = id(gate_fsm_state_text).state;
+              return (st == "OPENING") || (st == "OPENING_CYCLE") || (st == "CLOSING");
+          then:
+            - lambda: |-
+                const std::string st = id(gate_fsm_state_text).state;
+                const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
+                
+                const float eps = 0.001f;
+                const float total =
+                  opening
+                    ? ((id(measured_open_time) > eps) ? id(measured_open_time) : id(open_time_fallback))
+                    : ((id(measured_close_time) > eps) ? id(measured_close_time) : id(close_time_fallback));
+
+                if (total <= eps) return;
+
+                const float elapsed = (millis() - id(move_start_ms)) / 1000.0f;
+                const float delta = elapsed / total;
+                float pos = id(move_start_pos) + (opening ? +delta : -delta);
+
+                if (pos < 0.0f) pos = 0.0f;
+                if (pos > 1.0f) pos = 1.0f;
+
+                id(gate_pos) = pos;
+                
+                // Publish every 4th cycle (~100ms) to reduce traffic
+                id(publish_counter)++;
+                if (id(publish_counter) >= 4) {
+                  id(publish_counter) = 0;
+                  id(gate_cover).publish_state(pos);
+                  id(sensor_gate_pos).publish_state(pos * 100.0f);
+                  
+                }
+            - delay: 25ms
+      - logger.log: "Position tracking stopped"
+
+  #=========================================================================================
+  # INITIALIZATION
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # check_initial_state - Determines gate position from endstops on boot
+  #-----------------------------------------------------------------------------------------
+  - id: check_initial_state
+    mode: single
+    then:
+      - delay: 500ms
+      - if:
+          condition:
+            binary_sensor.is_on: gate_open_switch
+          then:
+            - logger.log: "Boot: detected at OPEN endstop"
+            - state_machine.transition:
+                id: gate_fsm
+                input: OPEN_ENDSTOP
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_on: gate_close_switch
+                then:
+                  - logger.log: "Boot: detected at CLOSED endstop"
+                  - state_machine.transition:
+                      id: gate_fsm
+                      input: CLOSE_ENDSTOP
+                else:
+                  - logger.log: "Boot: gate position unknown (mid-travel)"
+
+  #=========================================================================================
+  # AUTO-CLOSE
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # auto_close_countdown - Timer that triggers close after configurable delay
+  # Only counts down while gate is at OPEN endstop in OPEN_CYCLE state
+  #-----------------------------------------------------------------------------------------
+  - id: auto_close_countdown
+    mode: restart
+    then:
+      - lambda: |-
+          int duration = 20;
+          if (id(ui_gate_duration).has_state()) {
+            float raw = id(ui_gate_duration).state;
+            if (!isnan(raw) && raw >= 1.0f && raw <= 300.0f) {
+              duration = (int)raw;
+            }
+          }
+          id(gate_close_countdown) = duration;
+          id(auto_close_active) = true;
+          ESP_LOGI("auto_close", "Countdown started: %d seconds", duration);
+      - while:
+          condition:
+            lambda: 'return id(auto_close_active) && id(gate_close_countdown) > 0;'
+          then:
+            - delay: 1s
+            - script.execute: update_diagnostic_sensors
+
+            - lambda: |-
+                const std::string st = id(gate_fsm_state_text).state;
+                if (st == "OPEN_CYCLE" && id(gate_open_switch).state) {
+                  id(gate_close_countdown)--;
+                  
+                  ESP_LOGD("auto_close", "Countdown: %d", id(gate_close_countdown));
+                } else if (st != "OPEN_CYCLE") {
+                  ESP_LOGI("auto_close", "Left OPEN_CYCLE state, cancelling countdown");
+                  id(auto_close_active) = false;
+                }
+            - if:
+                condition:
+                  lambda: 'return id(auto_close_active) && id(gate_close_countdown) == 0;'
+                then:
+                  - script.execute: update_diagnostic_sensors
+                  - logger.log: "Auto-close countdown expired, closing gate"
+                  - lambda: 'id(auto_close_active) = false;'
+                  - state_machine.transition:
+                      id: gate_fsm
+                      input: CLOSE_CMD
+      # Always restore display to HA value when countdown ends for any reason
+      - lambda: |-
+          int duration = 20;
+          if (id(ui_gate_duration).has_state()) {
+            float raw = id(ui_gate_duration).state;
+            if (!isnan(raw) && raw >= 1.0f && raw <= 300.0f) {
+              duration = (int)raw;
+            }
+          }
+          id(gate_close_countdown) = duration;
+          ESP_LOGI("auto_close", "Countdown script ended, display restored to %d", duration);
+
+  #-----------------------------------------------------------------------------------------
+  # cancel_auto_close - Idempotent auto-close cancellation
+  # mode: restart ensures multiple calls are safe
+  #-----------------------------------------------------------------------------------------
+  - id: cancel_auto_close
+    mode: restart
+    then:
+      - lambda: |-
+          if (id(auto_close_active)) {
+            ESP_LOGI("auto_close", "Cancelled");
+          }
+          id(auto_close_active) = false;
+          // Restore display to HA value — never leave it showing 0 when idle
+          int duration = 20;
+          if (id(ui_gate_duration).has_state()) {
+            float raw = id(ui_gate_duration).state;
+            if (!isnan(raw) && raw >= 1.0f && raw <= 300.0f) {
+              duration = (int)raw;
+            }
+          }
+          id(gate_close_countdown) = duration;
+
+  #=========================================================================================
+  # SAFETY: OBSTACLE DETECTION
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # obstacle_monitor - Monitors motor current for obstacle detection
+  #
+  # SAFETY PHILOSOPHY: Err on the side of detection. Crushing is the worst failure mode.
+  #
+  # Features:
+  #   - 300ms grace period after motor start (inrush current settling)
+  #   - Skips while soft start is active (current unreliable at low PWM)
+  #   - Threshold increased 15% near endstops (normal mechanical resistance)
+  #     (reduced from 30% in V2 to catch more obstacles near endstops)
+  #   - First hit: reverse by configurable distance
+  #   - Second hit during reverse: immediate FAULT (hard stop)
+  #   - Disabled during timing learning runs
+  #-----------------------------------------------------------------------------------------
+  - id: obstacle_monitor
+    mode: restart
+    then:
+      - logger.log: "Obstacle monitoring started"
+      - while:
+          condition:
+            lambda: |-
+              if (id(motor_kill)) return false;
+              const std::string st = id(gate_fsm_state_text).state;
+              return (st == "OPENING") || (st == "OPENING_CYCLE") || (st == "CLOSING");
+          then:
+            - script.execute: update_diagnostic_sensors
+            - lambda: |-
+                const std::string st = id(gate_fsm_state_text).state;
+                const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
+                const bool closing = (st == "CLOSING");
+                if (!opening && !closing) return;
+
+                // Skip during timing learning (needs uninterrupted run)
+                if (id(timing_armed)) return;
+
+                // Grace period: skip checks while inrush current settles
+                if (id(obstacle_grace_remaining) > 0) {
+                  // Subtract loop period (50ms)
+                  if (id(obstacle_grace_remaining) > 50) {
+                    id(obstacle_grace_remaining) -= 50;
+                  } else {
+                    id(obstacle_grace_remaining) = 0;
+                    ESP_LOGD("obstacle", "Grace period ended, monitoring active");
+                  }
+                  return;
+                }
+
+                // Skip during soft start (current readings unreliable at low PWM)
+                if (id(soft_start_active)) return;
+
+                const float pos = id(gate_pos);
+
+                float current = id(gate_power_sensor_current).state;
+                if (isnan(current)) return;
+                current = fabsf(current);
+
+                // Calculate threshold with near-endstop adjustment
+                // V2.1: Reduced from 1.30 to 1.15 (err on side of detection)
+                float threshold = id(obstacle_current_threshold);
+                if (pos > 0.90f || pos < 0.10f) {
+                  threshold *= 1.15f;
+                }
+
+                // === DURING REVERSE: check for second obstacle (escalation to FAULT) ===
+                if (id(obstacle_reversing)) {
+                  if (current > threshold) {
+                    ESP_LOGE("obstacle",
+                            "OBSTACLE DURING REVERSE: %.3fA > %.3fA at pos %.0f%% -> FAULT",
+                            current, threshold, pos * 100);
+                    // IMMEDIATE motor kill - safety critical
+                    id(gate_control_gate_open).set_level(0.0f);
+                    id(gate_control_gate_close).set_level(0.0f);
+                    id(pwm_level) = 0.0f;
+
+                    id(obstacle_reversing) = false;
+                    id(obstacle_reverse_target) = 0.0f;
+                    id(obstacle_retry_armed) = false;
+                    id(gate_fsm).transition("FAULT_CMD");
+                    return;
+                  }
+
+                  // Check if reverse target reached
+                  float target = id(obstacle_reverse_target);
+                  bool reached = false;
+                  if (closing) {
+                    reached = (pos <= target + 0.02f);
+                  } else if (opening) {
+                    reached = (pos >= target - 0.02f);
+                  }
+
+                  if (reached) {
+                    ESP_LOGI("obstacle", "Reverse complete at %.0f%% -> STOP", pos * 100);
+                    // Immediate motor kill
+                    id(gate_control_gate_open).set_level(0.0f);
+                    id(gate_control_gate_close).set_level(0.0f);
+                    id(pwm_level) = 0.0f;
+
+                    id(obstacle_reversing) = false;
+                    id(obstacle_reverse_target) = 0.0f;
+                    id(obstacle_retry_armed) = false;
+                    id(gate_fsm).transition("STOP");
+                  }
+                  return;
+                }
+
+                // === NORMAL MONITORING: first obstacle hit ===
+                if (current > threshold) {
+                  ESP_LOGW("obstacle",
+                          "OBSTACLE HIT: %.3fA > %.3fA at pos %.0f%% -> reversing",
+                          current, threshold, pos * 100);
+
+                  // IMMEDIATE motor kill before reversing
+                  id(gate_control_gate_open).set_level(0.0f);
+                  id(gate_control_gate_close).set_level(0.0f);
+                  id(pwm_level) = 0.0f;
+
+                  id(obstacle_retry_armed) = true;
+                  id(obstacle_reversing) = true;
+
+                  const float reverse_dist = id(obstacle_reverse_distance);
+                  const float reverse_target =
+                    opening ? fmaxf(0.0f, pos - reverse_dist)
+                            : fminf(1.0f, pos + reverse_dist);
+
+                  id(obstacle_reverse_target) = reverse_target;
+
+                  ESP_LOGI("obstacle",
+                          "Reversing from %.0f%% to %.0f%%",
+                          pos * 100, reverse_target * 100);
+
+                  if (opening) {
+                    id(gate_fsm).transition("CLOSE_CMD");
+                  } else {
+                    id(gate_fsm).transition("OPEN_CMD");
+                  }
+                }
+            - delay: 50ms
+      - logger.log: "Obstacle monitoring stopped"
+
+
+
+  #=========================================================================================
+  # SAFETY: MOVEMENT TIMEOUT  (NEW in V2.1)
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # movement_timeout - Watchdog timer that faults if travel takes too long
+  # Protects against: failed endstop, mechanical jam, belt slip
+  # Timeout = learned_travel_time × 1.5  (or fallback × 1.5)
+  # Launched by motor_start, stopped by enter_idle_state
+  #-----------------------------------------------------------------------------------------
+  - id: movement_timeout
+    mode: restart
+    then:
+      - lambda: |-
+          const float eps = 0.001f;
+          float travel_time;
+          if (id(motion_dir) == 1) {
+            travel_time = (id(measured_open_time) > eps) 
+                          ? id(measured_open_time) 
+                          : id(open_time_fallback);
+          } else {
+            travel_time = (id(measured_close_time) > eps) 
+                          ? id(measured_close_time) 
+                          : id(close_time_fallback);
+          }
+          float timeout = travel_time * 1.5f;
+          ESP_LOGI("safety", "Movement timeout armed: %.1fs (travel=%.1fs × 1.5)", 
+                   timeout, travel_time);
+      # We can't use a dynamic delay directly, so we poll every second
+      # and check elapsed time against the calculated timeout
+      - while:
+          condition:
+            lambda: |-
+              if (id(motor_kill)) return false;
+              const std::string st = id(gate_fsm_state_text).state;
+              return (st == "OPENING") || (st == "OPENING_CYCLE") || (st == "CLOSING");
+          then:
+            - delay: 1s
+            - lambda: |-
+                const float eps = 0.001f;
+                float travel_time;
+                if (id(motion_dir) == 1) {
+                  travel_time = (id(measured_open_time) > eps) 
+                                ? id(measured_open_time) 
+                                : id(open_time_fallback);
+                } else {
+                  travel_time = (id(measured_close_time) > eps) 
+                                ? id(measured_close_time) 
+                                : id(close_time_fallback);
+                }
+                
+                float timeout_s = travel_time * 1.5f;
+                float elapsed_s = (millis() - id(move_start_ms)) / 1000.0f;
+                
+                if (elapsed_s >= timeout_s) {
+                  ESP_LOGE("safety", 
+                          "MOVEMENT TIMEOUT: %.1fs elapsed > %.1fs limit -> FAULT",
+                          elapsed_s, timeout_s);
+                  // IMMEDIATE motor kill
+                  id(gate_control_gate_open).set_level(0.0f);
+                  id(gate_control_gate_close).set_level(0.0f);
+                  id(pwm_level) = 0.0f;
+                  id(gate_fsm).transition("FAULT_CMD");
+                }
+
+  #=========================================================================================
+  # JOG CONTROL (hold-to-operate / dead man's switch)
+  #=========================================================================================
+  # Direct motor control that bypasses the FSM entirely.
+  # Motor runs at reduced speed (70%) only while the physical button is held.
+  # Stops immediately on: button release, endstop hit, or motor_kill flag.
+  #
+  # SAFETY:
+  #   - Endstop lockout: refuses to start if already at limit in that direction
+  #   - Stops any running FSM motion scripts to prevent PWM interference
+  #   - H-bridge dead time (150ms) when reversing direction
+  #   - Endstop watchdog interval (100ms) still active as backstop
+  #   - on_release handler provides backup motor kill if script.stop interrupts cleanup
+  #
+  # FSM SYNC:
+  #   - Jog does NOT transition the FSM (it's raw motor control)
+  #   - If jog hits an endstop, the endstop on_press handler fires independently
+  #     and transitions the FSM (OPEN_ENDSTOP/CLOSE_ENDSTOP) — this syncs state
+  #   - If jog stops mid-travel, FSM stays in its prior state
+  #   - Pressing Cycle after a jog will resume normal FSM operation
+  #
+  # POSITION:
+  #   - Basic time-based tracking runs in the while loop (50ms updates)
+  #   - Position resets to ground truth if endstop is hit
+  #   - No soft start/stop during jog (constant reduced PWM)
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # jog_open - Direct motor open while button held
+  #-----------------------------------------------------------------------------------------
+#-----------------------------------------------------------------------------------------
+  # jog - Direct motor control while button held (bypasses FSM)
+  # Parameters: dir = 1 (open) or -1 (close)
+  #-----------------------------------------------------------------------------------------
+  - id: jog
+    mode: restart
+    parameters:
+      dir: int
+    then:
+      # Endstop lockout - refuse to start if already at limit in this direction
+      - if:
+          condition:
+            lambda: |-
+              return (dir == 1 && id(gate_open_switch).state) ||
+                     (dir == -1 && id(gate_close_switch).state);
+          then:
+            - lambda: |-
+                ESP_LOGW("jog", "JOG %s blocked - at endstop", dir == 1 ? "OPEN" : "CLOSE");
+          else:
+            # Stop motor and all motion scripts (safe starting point)
+            - script.execute: motor_stop
+            # H-bridge dead time if reversing direction
+            - if:
+                condition:
+                  lambda: 'return id(motion_dir) == -dir;'
+                then:
+                  - delay: 150ms
+            # Start motor directly (bypasses FSM and soft start)
+            - lambda: |-
+                id(motor_kill) = false;
+                id(motion_dir) = dir;
+                id(move_start_ms) = millis();
+                id(move_start_pos) = id(gate_pos);
+                id(pwm_level) = 0.70f;
+                id(gate_control_gate_open).set_level(dir == 1 ? 0.70f : 0.0f);
+                id(gate_control_gate_close).set_level(dir == -1 ? 0.70f : 0.0f);
+                ESP_LOGI("jog", "JOG %s started at %.0f%%",
+                         dir == 1 ? "OPEN" : "CLOSE", id(gate_pos) * 100);
+            # Run while button held AND endstop not hit AND kill not asserted
+            - while:
+                condition:
+                  lambda: |-
+                    bool btn = (dir == 1) ? id(gate_open_cmd_button).state
+                                          : id(gate_close_cmd_button).state;
+                    bool endstop = (dir == 1) ? id(gate_open_switch).state
+                                              : id(gate_close_switch).state;
+                    return btn && !endstop && !id(motor_kill);
+                then:
+                  - lambda: |-
+                      // Position tracking
+                      const float eps = 0.001f;
+                      float total = (dir == 1)
+                        ? ((id(measured_open_time) > eps) ? id(measured_open_time) : id(open_time_fallback))
+                        : ((id(measured_close_time) > eps) ? id(measured_close_time) : id(close_time_fallback));
+                      float elapsed = (millis() - id(move_start_ms)) / 1000.0f;
+                      float pos = id(move_start_pos) + dir * (elapsed / total);
+                      pos = (dir == 1) ? fminf(pos, 1.0f) : fmaxf(pos, 0.0f);
+                      id(gate_pos) = pos;
+                  - delay: 25ms
+            # Cleanup — motor_stop handles PWM, just clear direction and log
+            # Note: if script.stop interrupts us, on_release handler calls motor_stop
+            - script.execute: motor_stop
+            - lambda: |-
+                id(motion_dir) = 0;
+                ESP_LOGI("jog", "JOG %s stopped at %.0f%%",
+                         dir == 1 ? "OPEN" : "CLOSE", id(gate_pos) * 100);
+
+  #=========================================================================================
+  # POSITION CONTROL
+  #=========================================================================================
+
+  #-----------------------------------------------------------------------------------------
+  # move_to_position - Sets target and triggers appropriate FSM motion
+  #-----------------------------------------------------------------------------------------
+  - id: move_to_position
+    mode: restart
+    parameters:
+      target: float
+    then:
+      - lambda: |-
+          float current = id(gate_pos);
+          
+          if (fabsf(target - current) < 0.02f) {
+            ESP_LOGI("position", "Already at %.0f%% (within deadband)", target * 100);
+            return;
+          }
+          
+          id(position_target) = target;
+          ESP_LOGI("position", "Moving from %.0f%% to %.0f%%", current * 100, target * 100);
+          
+          if (target > current) {
+            id(gate_fsm).transition("OPEN_CMD");
+          } else {
+            id(gate_fsm).transition("CLOSE_CMD");
+          }
+
+  - id: update_diagnostic_sensors
+    mode: restart
+    then:
+      - component.update: gate_power_sensor
+      - component.update: sensor_gate_pos
+      - component.update: sensor_move_start_ms
+      - component.update: sensor_move_start_pos
+      - component.update: sensor_operation_start_time
+      - component.update: sensor_measured_open_time
+      - component.update: sensor_measured_close_time
+      - component.update: sensor_pwm_level
+      - component.update: sensor_close_countdown
+      - component.update: sensor_obstacle_threshold
+
+
+#############################################################################################
+# COVER COMPONENT
+#############################################################################################
+#
+# The cover is a thin facade:
+# - Reports current position from gate_pos global
+# - Forwards open/close/stop commands to FSM
+# - Receives state updates from FSM via cover.template.publish
+#
+#############################################################################################
+
+cover:
+  - platform: template
+    name: "Gate"
+    id: gate_cover
+    device_class: gate
+    has_position: true
+    optimistic: false
+
+    lambda: |-
+      return id(gate_pos);
+
+    open_action:
+      - logger.log: "Cover: OPEN_CMD"
+      - state_machine.transition:
+          id: gate_fsm
+          input: OPEN_CMD
+
+    close_action:
+      - logger.log: "Cover: CLOSE_CMD"
+      - state_machine.transition:
+          id: gate_fsm
+          input: CLOSE_CMD
+
+    stop_action:
+      - logger.log: "Cover: STOP"
+      - state_machine.transition:
+          id: gate_fsm
+          input: STOP
+    
+    position_action:
+      - script.execute:
+          id: move_to_position
+          target: !lambda 'return pos;'

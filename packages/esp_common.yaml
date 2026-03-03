@@ -1,0 +1,190 @@
+#==============================================================================
+# ESPHome Base Package (Universal)
+#==============================================================================
+# File: packages/esp_common.yaml
+#
+# Core sensors and controls common to ALL ESPHome devices (ESP32 and ESP8266).
+# Provides device status, connectivity info, uptime tracking, and management.
+#
+# DEPENDENCIES:
+#   None - this package is self-contained
+#
+# REQUIRED SUBSTITUTIONS:
+#   - device_name     : ESPHome device name (lowercase, dashes ok)
+#   - friendly_name   : Human-readable device name (e.g., "Gate Controller")
+#   - name_no_dashes  : Device name without dashes for IDs (e.g., "gate_controller")
+#   - device_description : Short description of the device
+#
+# PROVIDES:
+#   IDs:
+#     - uptime_sensor                    : Raw uptime in seconds (internal)
+#     - ${name_no_dashes}_uptime_human   : Human-readable uptime text sensor
+#     - device_time                      : Time component (synced from Home Assistant)
+#
+# ENTITIES EXPOSED TO HOME ASSISTANT:
+#   Binary Sensors:
+#     - Status                : Online/offline connectivity (device_class: connectivity)
+#   Sensors:
+#     - WiFi Signal Strength  : RSSI in dBm
+#   Text Sensors:
+#     - Uptime                : Human-readable (e.g., "2d 5h 30m 15s")
+#     - ESPHome Version       : Installed ESPHome version
+#     - IP                    : Current IP address
+#     - SSID                  : Connected WiFi network
+#     - BSSID                 : Access point MAC address
+#     - MAC                   : Device MAC address
+#   Switches:
+#     - Restart               : Remote restart control
+#
+# STATUS LED:
+#   This package does NOT define status LED behavior. Each hardware package
+#   (wemos_d1_mini32.yaml, switchbot_miniplug_W1901400.yaml, etc.) provides
+#   its own LED output, effects, update_status_led script, and connectivity
+#   callbacks since LED pins and capabilities vary by hardware.
+#
+# USAGE:
+#   substitutions:
+#     device_name: "my-device"
+#     device_description: "My awesome device"
+#     friendly_name: "My Device"
+#     name_no_dashes: "my_device"
+#
+#   packages:
+#     base: !include packages/esp_common.yaml
+#     hardware: !include packages/wemos_d1_mini32.yaml
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# Core ESPHome Configuration
+#------------------------------------------------------------------------------
+esphome:
+  name: ${device_name}
+  comment: ${device_description}
+  friendly_name: ${friendly_name}
+
+#------------------------------------------------------------------------------
+# Connectivity
+#------------------------------------------------------------------------------
+logger:
+  level: DEBUG
+  logs:
+    light: INFO  # Silence DEBUG spam from status LED glow effect
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  min_auth_mode: wpa2
+  domain: !secret wifi_domain
+  ap:
+    ssid: "${device_name}"
+
+captive_portal:
+
+web_server:
+  version: 2
+  port: 80
+
+#------------------------------------------------------------------------------
+# Time (synced from Home Assistant)
+#------------------------------------------------------------------------------
+time:
+  - platform: homeassistant
+    id: device_time
+
+#------------------------------------------------------------------------------
+# Binary Sensors
+#------------------------------------------------------------------------------
+binary_sensor:
+  # API/MQTT connection status - goes unavailable if device disconnects
+  - platform: status
+    name: "Status"
+    entity_category: diagnostic
+
+#------------------------------------------------------------------------------
+# Sensors
+#------------------------------------------------------------------------------
+sensor:
+  # WiFi signal strength in dBm
+  # Typical values: -30 (excellent) to -90 (poor)
+  - platform: wifi_signal
+    name: "WiFi Signal Strength"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  # Internal uptime counter - drives the human-readable text sensor
+  - platform: uptime
+    name: "Uptime Seconds"
+    id: uptime_sensor
+    update_interval: 60s
+    internal: true
+    on_raw_value:
+      then:
+        - text_sensor.template.publish:
+            id: ${name_no_dashes}_uptime_human
+            state: !lambda |-
+              int seconds = round(id(uptime_sensor).raw_state);
+              int days = seconds / (24 * 3600);
+              seconds = seconds % (24 * 3600);
+              int hours = seconds / 3600;
+              seconds = seconds % 3600;
+              int minutes = seconds / 60;
+              seconds = seconds % 60;
+              return (
+                (days ? to_string(days) + "d " : "") +
+                (hours ? to_string(hours) + "h " : "") +
+                (minutes ? to_string(minutes) + "m " : "") +
+                (to_string(seconds) + "s")
+              ).c_str();
+
+#------------------------------------------------------------------------------
+# Text Sensors
+#------------------------------------------------------------------------------
+text_sensor:
+  # Human-readable uptime (e.g., "2d 5h 30m 15s")
+  - platform: template
+    name: "Uptime"
+    id: ${name_no_dashes}_uptime_human
+    icon: mdi:clock-start
+    entity_category: diagnostic
+
+  # ESPHome version for tracking firmware
+  - platform: version
+    name: "ESPHome Version"
+    entity_category: diagnostic
+
+  # WiFi connection details - useful for debugging network issues
+  - platform: wifi_info
+    ip_address:
+      name: "IP"
+      icon: mdi:ip-outline
+      entity_category: diagnostic
+
+    ssid:
+      name: "SSID"
+      icon: mdi:wifi-settings
+      entity_category: diagnostic
+
+    bssid:
+      name: "BSSID"
+      icon: mdi:wifi-settings
+      entity_category: diagnostic
+
+    mac_address:
+      name: "MAC"
+      icon: mdi:network-outline
+      entity_category: diagnostic
+
+#------------------------------------------------------------------------------
+# Switches
+#------------------------------------------------------------------------------
+switch:
+  # Remote restart - useful for applying config changes or recovering
+  - platform: restart
+    name: "Restart"
+    entity_category: config
