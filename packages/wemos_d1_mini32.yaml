@@ -1,13 +1,13 @@
 #==============================================================================
 # Wemos D1 Mini32 - Hardware Package
 #==============================================================================
-# File: common/wemos_d1_mini32.yaml
+# File: packages/wemos_d1_mini32.yaml
 #
 # Hardware-specific configuration for Wemos D1 Mini32 (ESP32).
 # Defines board, status LED with connection-aware effects, and OTA tracking.
 #
 # DEPENDENCIES:
-#   - common/esp_common.yaml (provides esphome config, connectivity, sensors)
+#   - packages/esp_common.yaml (provides esphome config, connectivity, sensors)
 #
 # REQUIRED SUBSTITUTIONS (from esp_common.yaml):
 #   - device_name     : ESPHome device name
@@ -28,8 +28,8 @@
 #
 # USAGE:
 #   packages:
-#     base: !include common/esp_common.yaml
-#     hardware: !include common/wemos_d1_mini32.yaml
+#     base: !include packages/esp_common.yaml
+#     hardware: !include packages/wemos_d1_mini32.yaml
 #==============================================================================
 
 substitutions:

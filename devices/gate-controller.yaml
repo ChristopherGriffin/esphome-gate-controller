@@ -114,106 +114,41 @@
 #
 #   OPEN_CYCLE: CYCLE → OPEN (cancels countdown)
 #
-# CHANGES IN V2.3  (vs V2.2) — CRITICAL SAFETY FIX: ENDSTOP OVERRUN
-# ===================================================================
+# ENDSTOP SAFETY DESIGN: DEFENSE IN DEPTH
+# ========================================
 #
 # ROOT CAUSE: on_press is EDGE-TRIGGERED (fires only on OFF→ON transition).
-# V2.2's direct PWM kill in on_press correctly zeroed the motor, BUT running
-# scripts (soft_stop_ramp, position_tracking) could write PWM BACK on their
-# very next loop iteration — before their while-condition detected the state
-# change. Since on_press had already fired, there was no second trigger.
-# The motor re-activated, drove the gate through the endstop, and hit the wall.
+# A direct PWM kill in on_press correctly zeros the motor, BUT running scripts
+# (soft_stop_ramp, position_tracking) can write PWM BACK on their very next
+# loop iteration — before their while-condition detects the state change.
+# Since on_press already fired, there is no second trigger. The motor
+# re-activates and drives the gate through the endstop.
 #
-# FIX LAYERS (defense in depth):
+# Five independent layers prevent this:
 #
 # Layer 1: motor_kill GLOBAL INTERLOCK
-#   - New boolean global: when true, apply_pwm ALWAYS writes zero
-#   - Set by: endstop on_press, motor_stop, obstacle FAULT, movement timeout
+#   - Boolean global: when true, apply_pwm ALWAYS writes zero regardless of pwm_level
+#   - Set by: endstop handlers, motor_stop, obstacle FAULT, movement timeout
 #   - Cleared ONLY by: motor_start (intentional motion)
-#   - Even if a stale script calls apply_pwm, the kill switch blocks it
 #
 # Layer 2: EXPLICIT script.stop IN ENDSTOP HANDLERS
-#   - Endstop on_press now calls script.stop on ALL 5 motion scripts:
-#     soft_start_ramp, soft_stop_ramp, position_tracking,
-#     obstacle_monitor, movement_timeout
-#   - Scripts are terminated before FSM transition, not after
+#   - Terminates all 5 motion scripts before FSM transition
 #   - No running script survives to write PWM back
 #
 # Layer 3: motor_kill CHECK IN ALL WHILE-LOOP CONDITIONS
-#   - Every motion script's while condition now checks motor_kill first
-#   - If motor_kill is true, the loop exits immediately on next condition check
-#   - Belt-and-suspenders: even if script.stop somehow fails, the loop self-terminates
+#   - Every motion script's while condition checks motor_kill first
+#   - Loop self-terminates even if script.stop somehow fails
 #
 # Layer 4: LEVEL-TRIGGERED ENDSTOP CHECKS IN LOOP BODIES
-#   - soft_start_ramp and soft_stop_ramp check endstop state at the TOP of each iteration
-#   - If endstop is active in direction of travel → immediate hardware kill + motor_kill
-#   - This catches the case where PWM was written back between on_press and script.stop
+#   - soft_start_ramp and soft_stop_ramp check endstop state at the top of each iteration
+#   - Catches the case where PWM was written back between on_press and script.stop
 #
 # Layer 5: INTERVAL-BASED SAFETY WATCHDOG (100ms)
 #   - Completely independent of scripts, FSM, and the binary_sensor system
-#   - Runs on the main loop every 100ms
 #   - If motion_dir is non-zero AND the relevant endstop is active → hardware kill
-#   - This is the ULTIMATE backstop — catches any failure mode in layers 1-4
-#   - Worst case: motor runs 100ms past endstop (vs >1 second in V2)
+#   - Ultimate backstop — worst case: 100ms of extra travel
 #
-# CHANGES IN V2.2  (vs V2.1)
-# =========================
-#
-# CRITICAL SAFETY FIX: Endstop-triggered motor stop was delayed by 3 levels of
-# async script.execute calls (enter_idle_state → motor_stop → apply_pwm).
-# Gate could travel 80-150ms past the endstop before PWM actually reached zero.
-#
-# 1. IMMEDIATE MOTOR KILL ON ENDSTOP
-#    - Endstop on_press handlers now zero BOTH PWM outputs directly via
-#      output.set_level BEFORE sending the FSM input
-#    - Motor stops in the same main loop iteration as endstop detection
-#    - FSM transition happens after (handles state management, not safety)
-#
-# 2. MOTOR_STOP: DIRECT HARDWARE ACCESS
-#    - motor_stop now uses output.set_level directly instead of async apply_pwm
-#    - Eliminates one level of async delay in ALL stop paths
-#
-# 3. ALL SAFETY-CRITICAL STOPS: DIRECT HARDWARE KILL
-#    - Obstacle detection (first hit, reverse hit, FAULT) kills PWM in-lambda
-#    - Movement timeout kills PWM in-lambda before FAULT_CMD
-#    - Pattern: hardware kill first, THEN FSM transition for state management
-#
-# 4. REDUCED SOFT STOP MINIMUM PWM: 0.45 → 0.30
-#    - Gate approaches endstop with significantly less force
-#    - Reduces mechanical impact and momentum carry-through
-#    - Verify your gate still moves reliably at 30% — increase if it stalls
-#
-# CHANGES IN V2.1  (vs V2)
-# =========================
-#
-# 1. MOVEMENT TIMEOUT SAFETY
-#    - New movement_timeout script triggers FAULT if travel exceeds learned_time * 1.5
-#    - Prevents indefinite motor run if endstop fails or gate physically jams
-#    - Launched from motor_start, cancelled by enter_idle_state
-#
-# 2. OBSTACLE DETECTION IMPROVEMENTS
-#    - 300ms grace period after motor start to avoid inrush current false positives
-#    - Reduced endstop threshold multiplier from 1.30× to 1.15× (err on side of detection)
-#    - Obstacle state (retry_armed, reversing) preserved across pauses
-#      (user pausing during obstacle reverse no longer resets retry escalation)
-#    - Explicit skip during soft start ramp (PWM < 50% = unreliable current readings)
-#
-# 3. CYCLE FROM PAUSED_FROM_CLOSING → OPENING (not OPENING_CYCLE)
-#    - Removes surprise auto-close when user manually reverses from a closing pause
-#    - Now symmetric: both pause states resume to non-auto-close motion
-#
-# 4. POSITION TRACKING PUBLISH FIX
-#    - publish_counter moved from static local to proper global variable
-#    - Prevents counter persistence across script restarts causing missed publishes
-#
-# 5. FALLBACK TIME WARNINGS
-#    - Logs WARNING when using fallback travel times (timing not yet learned)
-#    - Makes it obvious in logs that position accuracy may be degraded
-#
-# 6. CODE CLEANUP
-#    - Renamed unclear 'dominated' variable to 'timing_just_armed'
-#    - cancel_auto_close changed from mode:single to mode:restart (idempotent safety)
-#    - Minor formatting and comment improvements
+# See README.md for full version changelog.
 #
 # FEATURES
 # ========
@@ -498,20 +433,6 @@ external_components:
     refresh: 1d
 
 #############################################################################################
-# NETWORK OVERRIDES (gate-specific additions to esp_common defaults)
-#############################################################################################
-
-# api:
-#   encryption:
-#     key: !secret api_encryption_key
-
-# ota:
-#   password: !secret ota_password
-
-# web_server:
-#   version: 2
-
-#############################################################################################
 # ENDSTOP SAFETY WATCHDOG (runs independently of FSM and scripts)
 #############################################################################################
 # This is the ULTIMATE BACKSTOP. It runs every 100ms on the main loop, completely
@@ -606,8 +527,8 @@ interval:
             id(led_fault).set_state(false);
           }
           
-          // Stop LED: on when gate stopped mid-travel (IDLE = stopped, not at endstop)
-          id(led_stop).set_state(st == "IDLE");
+          // Stop LED: on when gate stopped mid-travel (not at an endstop)
+          id(led_stop).set_state(st == "STOPPED" || st == "PAUSED_FROM_OPENING" || st == "PAUSED_FROM_CLOSING");
 
 #############################################################################################
 # I2C BUS CONFIGURATION
@@ -2360,9 +2281,6 @@ script:
   #=========================================================================================
 
   #-----------------------------------------------------------------------------------------
-  # jog_open - Direct motor open while button held
-  #-----------------------------------------------------------------------------------------
-#-----------------------------------------------------------------------------------------
   # jog - Direct motor control while button held (bypasses FSM)
   # Parameters: dir = 1 (open) or -1 (close)
   #-----------------------------------------------------------------------------------------
