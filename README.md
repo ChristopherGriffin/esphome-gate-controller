@@ -218,14 +218,6 @@ Create it before flashing (min: 1, max: 300, step: 1, unit: seconds).
 
 ## Changelog
 
-### v2.3 — Endstop Overrun Safety Fix *(current)*
+### v1.0 — Initial Release
 
-Fixed a race condition where edge-triggered `on_press` correctly zeroed PWM, but still-running scripts (`soft_stop_ramp`, `position_tracking`) wrote PWM back on their next iteration before detecting the state change. Added five independent safety layers: `motor_kill` global interlock, explicit `script.stop` in endstop handlers, `motor_kill` check in every while-loop condition, level-triggered endstop checks inside ramp loops, and a 100 ms watchdog interval as the final backstop.
-
-### v2.2 — Immediate Endstop Motor Kill
-
-Endstop handlers now zero PWM outputs directly (via `output.set_level`) before sending the FSM input, eliminating 2–3 levels of async script-call delay (previously up to 150 ms). `motor_stop` also uses `output.set_level` directly. Soft stop minimum PWM reduced from 45% to 30%.
-
-### v2.1 — Movement Timeout and Obstacle Improvements
-
-Added movement timeout watchdog (1.5× travel time → FAULT). Obstacle detection improvements: 300 ms inrush grace period, near-endstop threshold multiplier reduced from 1.30× to 1.15×, retry state preserved across pauses. CYCLE from `PAUSED_FROM_CLOSING` now goes to `OPENING` (not `OPENING_CYCLE`). Position tracking publish counter moved to a global variable to prevent counter persistence across script restarts.
+Full-featured FSM-based gate controller with soft start/stop, time-based position tracking, timing learning, one-button cycle control with auto-close, hold-to-operate jog buttons, current-based obstacle detection with automatic reversal, movement timeout watchdog, and a five-layer endstop overrun safety architecture.

@@ -154,7 +154,7 @@
 #   - If motion_dir is non-zero AND the relevant endstop is active → hardware kill
 #   - Ultimate backstop — worst case: 100ms of extra travel
 #
-# See README.md for full version changelog.
+# See README.md for full documentation.
 #
 # FEATURES
 # ========
