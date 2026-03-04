@@ -28,14 +28,20 @@
 #     GPA6: Reboot/Reset button (3s hold = reboot, 10s hold = reset times + reboot)
 #     GPA7: (spare)
 #   Port B - LED Outputs:
-#     GPB0: Open endstop LED (green)   - on when at open limit
-#     GPB1: Closed endstop LED (green) - on when at close limit
-#     GPB2: Opening LED (amber)        - on while opening
-#     GPB3: Closing LED (amber)        - on while closing
-#     GPB4: Auto-close LED (blue)      - on when armed, 1Hz flash during countdown
-#     GPB5: Fault LED (red)            - solid = fault, 2Hz flash
-#     GPB6: Stop LED (red)             - on when stopped mid-travel
-#     GPB7: (spare)
+#     GPB0: Open LED   - see LED behavior table below
+#     GPB1: Close LED  - see LED behavior table below
+#     GPB2-GPB7: (spare)
+#
+# LED BEHAVIOR:
+#   State                    OPEN LED (GPB0)          CLOSE LED (GPB1)
+#   OPEN                     Solid                    Off
+#   CLOSED                   Off                      Solid
+#   OPENING / OPENING_CYCLE  Fast flash (2Hz)         Off
+#   CLOSING                  Off                      Fast flash (2Hz)
+#   OPEN_CYCLE (auto-close)  Slow pulse (1Hz)         Off
+#   STOPPED / PAUSED         Fast flash (2Hz)         Fast flash (2Hz)
+#   FAULT                    Solid                    Solid
+#   STOPPED_UNKNOWN (boot)   Alternating fast flash   Alternating fast flash
 # - INA260 Current Sensor (address 0x40) - for motor current monitoring
 # - PWM motor driver on GPIO16 (open) and GPIO17 (close)
 # - Power LED wired directly to 3.3V (no GPIO needed)
@@ -277,7 +283,7 @@
 #
 # Panel Controls:
 #   reboot_btn_press_ms - Timestamp when reboot/reset button was pressed
-#   fault_led_state     - Toggle state for fault LED flashing
+#   led_tick            - Tick counter for LED flash pattern timing
 #
 # SCRIPTS REFERENCE
 # =================
@@ -480,55 +486,48 @@ interval:
 
   #-----------------------------------------------------------------------------------------
   # PANEL LED UPDATE - 250ms
-  # Reads FSM state + sensor state and drives all panel LEDs.
-  # Runs independently of FSM/scripts for maximum reliability.
+  # Drives OPEN LED (GPB0) and CLOSE LED (GPB1) based on FSM state and motion direction.
+  # motion_dir is checked first so jog mode is reflected correctly.
   #
-  # LED behaviors:
-  #   Endstop LEDs:   follow physical switch state (solid green)
-  #   Direction LEDs: on while moving in that direction (solid amber)
-  #   Auto-close LED: 1Hz flash while countdown active, off otherwise
-  #   Fault LED:      2Hz flash while in FAULT state
-  #   Stop LED:       on when gate stopped mid-travel (IDLE state)
+  # Fast flash (2Hz) : led_tick % 2 == 0  →  250ms on / 250ms off
+  # Slow pulse (1Hz) : led_tick % 4 < 2   →  500ms on / 500ms off
+  # Alternating      : OPEN = fast, CLOSE = !fast  (A on when B off)
   #-----------------------------------------------------------------------------------------
   - interval: 250ms
     then:
       - lambda: |-
+          id(led_tick)++;
+          if (id(led_tick) >= 8) id(led_tick) = 0;
+
+          const bool fast = (id(led_tick) % 2 == 0);
+          const bool slow = (id(led_tick) % 4 < 2);
+
+          const int dir = id(motion_dir);
           const std::string st = id(gate_fsm_state_text).state;
-          
-          // Endstop LEDs: follow physical switch state
-          id(led_open_endstop).set_state(id(gate_open_switch).state);
-          id(led_closed_endstop).set_state(id(gate_close_switch).state);
-          
-          // Direction LEDs: on while moving (FSM motion OR jog mode)
-          const bool opening = (st == "OPENING" || st == "OPENING_CYCLE" || id(motion_dir) == 1);
-          const bool closing = (st == "CLOSING" || id(motion_dir) == -1);
-          id(led_opening).set_state(opening);
-          id(led_closing).set_state(closing);
-          
-          // Auto-close LED: 1Hz flash while countdown active
-          // 250ms interval → toggle every 2 ticks = 500ms on / 500ms off = 1Hz
-          if (id(auto_close_active)) {
-            id(auto_close_flash_counter)++;
-            if (id(auto_close_flash_counter) >= 2) {
-              id(auto_close_flash_counter) = 0;
-            }
-            id(led_auto_close).set_state(id(auto_close_flash_counter) == 0);
-          } else {
-            id(auto_close_flash_counter) = 0;
-            id(led_auto_close).set_state(false);
-          }
-          
-          // Fault LED: 2Hz flash (toggle each 250ms tick) while in FAULT
+
+          bool open_led = false;
+          bool close_led = false;
+
           if (st == "FAULT") {
-            id(fault_led_state) = !id(fault_led_state);
-            id(led_fault).set_state(id(fault_led_state));
+            open_led = true; close_led = true;                   // Both solid
+          } else if (dir == 1) {
+            open_led = fast; close_led = false;                  // Opening (FSM or jog)
+          } else if (dir == -1) {
+            open_led = false; close_led = fast;                  // Closing (FSM or jog)
+          } else if (st == "OPEN_CYCLE") {
+            open_led = slow; close_led = false;                  // Auto-close countdown
+          } else if (st == "OPEN") {
+            open_led = true; close_led = false;                  // At open endstop
+          } else if (st == "CLOSED") {
+            open_led = false; close_led = true;                  // At close endstop
+          } else if (st == "STOPPED" || st == "PAUSED_FROM_OPENING" || st == "PAUSED_FROM_CLOSING") {
+            open_led = fast; close_led = fast;                   // Stopped mid-travel
           } else {
-            id(fault_led_state) = false;
-            id(led_fault).set_state(false);
+            open_led = fast; close_led = !fast;                  // STOPPED_UNKNOWN: alternating
           }
-          
-          // Stop LED: on when gate stopped mid-travel (not at an endstop)
-          id(led_stop).set_state(st == "STOPPED" || st == "PAUSED_FROM_OPENING" || st == "PAUSED_FROM_CLOSING");
+
+          id(led_open).set_state(open_led);
+          id(led_close).set_state(close_led);
 
 #############################################################################################
 # I2C BUS CONFIGURATION
@@ -736,15 +735,11 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  # Fault LED toggle state (for flashing)
-  - id: fault_led_state
-    type: bool
-    restore_value: no
-    initial_value: "false"
-
-  # Auto-close LED flash counter (1Hz = toggle every 2 ticks at 250ms interval)
-  - id: auto_close_flash_counter
-    type: int
+  # Tick counter for LED flash patterns (increments every 250ms)
+  # fast flash (2Hz): tick % 2 == 0   → 250ms on / 250ms off
+  # slow pulse (1Hz): tick % 4 < 2    → 500ms on / 500ms off
+  - id: led_tick
+    type: uint8_t
     restore_value: no
     initial_value: "0"
 
@@ -766,11 +761,11 @@ output:
     id: gate_control_gate_close
 
   #-----------------------------------------------------------------------------------------
-  # PANEL LEDs (MCP23017 GPB0-GPB6)
+  # PANEL LEDs (MCP23017 GPB0-GPB1)
   #-----------------------------------------------------------------------------------------
-  
+
   - platform: gpio
-    id: led_open_endstop
+    id: led_open
     pin:
       mcp23xxx: gate_io_expander
       number: 8          # GPB0
@@ -778,50 +773,10 @@ output:
       inverted: false
 
   - platform: gpio
-    id: led_closed_endstop
+    id: led_close
     pin:
       mcp23xxx: gate_io_expander
       number: 9          # GPB1
-      mode: output
-      inverted: false
-
-  - platform: gpio
-    id: led_opening
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 10         # GPB2
-      mode: output
-      inverted: false
-
-  - platform: gpio
-    id: led_closing
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 11         # GPB3
-      mode: output
-      inverted: false
-
-  - platform: gpio
-    id: led_auto_close
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 12         # GPB4
-      mode: output
-      inverted: false
-
-  - platform: gpio
-    id: led_fault
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 13         # GPB5
-      mode: output
-      inverted: false
-
-  - platform: gpio
-    id: led_stop
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 14         # GPB6
       mode: output
       inverted: false
 

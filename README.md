@@ -14,7 +14,7 @@ A feature-rich smart gate/door controller for Home Assistant, built with a Finit
 - **Timing Learning** — automatically measures full travel time on the first run; persists across reboots
 - **Obstacle Detection** — current-based detection with configurable threshold and automatic reversal
 - **Movement Timeout** — watchdog that faults the controller if travel exceeds 1.5× expected time
-- **Control Panel** — 5 buttons and 7 LEDs for standalone operation without a phone or PC
+- **Control Panel** — 5 buttons and 2 LEDs for standalone operation without a phone or PC
 
 ## Safety Architecture
 
@@ -54,18 +54,26 @@ Multiple independent layers prevent the gate from overrunning its endstops:
 | GPA6 | Reboot/Reset button (3 s = reboot, 10 s = reset learned times + reboot) |
 | GPA7 | Spare |
 
-**Port B — LED Outputs (GPB0–GPB6):**
+**Port B — LED Outputs (GPB0–GPB1):**
 
-| Pin | LED | Color | Behavior |
-|-----|-----|-------|----------|
-| GPB0 | Open endstop | Green | On when at open limit |
-| GPB1 | Close endstop | Green | On when at close limit |
-| GPB2 | Opening | Amber | On while opening |
-| GPB3 | Closing | Amber | On while closing |
-| GPB4 | Auto-close | Blue | On when armed; 1 Hz flash during countdown |
-| GPB5 | Fault | Red | 2 Hz flash in fault state |
-| GPB6 | Stop | Red | On when stopped mid-travel |
-| GPB7 | Spare | — | — |
+| Pin | LED | Behavior |
+|-----|-----|----------|
+| GPB0 | Open LED | See table below |
+| GPB1 | Close LED | See table below |
+| GPB2–GPB7 | Spare | — |
+
+**LED behavior:**
+
+| Gate state | Open LED (GPB0) | Close LED (GPB1) |
+|------------|-----------------|------------------|
+| OPEN | Solid | Off |
+| CLOSED | Off | Solid |
+| Opening / Opening with auto-close | Fast flash (2 Hz) | Off |
+| Closing | Off | Fast flash (2 Hz) |
+| Auto-close countdown (at open endstop) | Slow pulse (1 Hz) | Off |
+| Stopped mid-travel | Fast flash (2 Hz) | Fast flash (2 Hz) |
+| FAULT | Solid | Solid |
+| Boot / position unknown | Alternating fast flash | Alternating fast flash |
 
 ## Repository Structure
 
