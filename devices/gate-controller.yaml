@@ -2365,9 +2365,6 @@ script:
       - component.update: sensor_pwm_level
       - component.update: sensor_close_countdown
       - component.update: sensor_obstacle_threshold
-      - component.update: sensor_gate_ajar
-      - component.update: sensor_motor_opening
-      - component.update: sensor_motor_closing
 
 
 #############################################################################################
