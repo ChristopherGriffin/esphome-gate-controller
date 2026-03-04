@@ -399,10 +399,31 @@ substitutions:
   name_no_dashes: gate_control_v2
   friendly_name: Gate Control V2
   restore_mode_setting: RESTORE_DEFAULT_OFF
-  open_pin: GPIO16      # PWM output for opening motor direction
+
+  # ESP32 GPIO pins
+  open_pin:  GPIO16     # PWM output for opening motor direction
   close_pin: GPIO17     # PWM output for closing motor direction
-  i2c_sda: GPIO21       # I2C data line for MCP23017 and INA260
-  i2c_scl: GPIO22       # I2C clock line
+  i2c_sda:   GPIO21     # I2C data line (MCP23017 + INA260)
+  i2c_scl:   GPIO22     # I2C clock line
+
+  # I2C peripheral addresses (change if address pins are wired differently)
+  mcp23017_address: "0x20"   # MCP23017 GPIO expander  (A0-A2 pins set this)
+  ina260_address:   "0x40"   # INA260 current sensor    (VS  pin  sets this)
+
+  # MCP23017 wiring reference (pin numbers defined inline next to each sensor/output)
+  # Port A - Inputs, active low, internal pullup:
+  #   GPA0 (pin  0) : Open endstop switch
+  #   GPA1 (pin  1) : Close endstop switch
+  #   GPA2 (pin  2) : Cycle button (momentary)
+  #   GPA3 (pin  3) : Open button  (hold-to-operate)
+  #   GPA4 (pin  4) : Close button (hold-to-operate)
+  #   GPA5 (pin  5) : Stop button  (momentary)
+  #   GPA6 (pin  6) : Reboot/Reset button
+  #   GPA7 (pin  7) : spare
+  # Port B - Outputs:
+  #   GPB0 (pin  8) : Open LED
+  #   GPB1 (pin  9) : Close LED
+  #   GPB2-GPB7     : spare
 
 #############################################################################################
 # ESPHOME CORE CONFIGURATION
@@ -545,7 +566,7 @@ i2c:
 
 mcp23017:
   - id: gate_io_expander
-    address: 0x20
+    address: ${mcp23017_address}
 
 #############################################################################################
 # GLOBALS (STATE VARIABLES)
@@ -789,7 +810,7 @@ sensor:
   # CURRENT SENSOR - INA260
   #-----------------------------------------------------------------------------------------
   - platform: ina260
-    address: 0x40
+    address: ${ina260_address}
     id: gate_power_sensor
     update_interval: never
     current:
