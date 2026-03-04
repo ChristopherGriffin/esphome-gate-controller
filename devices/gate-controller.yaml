@@ -1,6 +1,6 @@
 #############################################################################################
 #                                                                                           #
-#                           GATE CONTROLLER V2.3 - FSM BASED                                #
+#                              GATE CONTROLLER - FSM BASED                                  #
 #                                                                                           #
 #############################################################################################
 #
@@ -217,7 +217,7 @@
 #    - Second hit during reverse: FAULT state (hard stop)
 #    - Disabled during timing learning runs
 #
-# 9. MOVEMENT TIMEOUT (NEW in V2.1)
+# 9. MOVEMENT TIMEOUT
 #    - Watchdog timer based on learned travel time × 1.5
 #    - Triggers FAULT_CMD if gate hasn't reached destination
 #    - Protects against stuck endstops, mechanical jams, or belt slip
@@ -357,8 +357,8 @@
 #
 # Position tracking inaccurate:
 #   - Reset learned times and do a full endstop-to-endstop run
-#   - Look for "FALLBACK" warnings in logs (timing not learned yet)
-#   - Ensure fallback times are reasonable for your gate
+#   - Look for "Timing not learned" warnings in logs
+#   - Ensure default times are reasonable for your gate
 #   - Position resets to ground truth at endstops
 #
 # Soft start/stop not working:
@@ -692,7 +692,7 @@ globals:
     initial_value: "0"
 
   #-----------------------------------------------------------------------------------------
-  # FALLBACK VALUES (used before timing is learned)
+  # DEFAULT TRAVEL TIMES (used before timing is learned)
   #-----------------------------------------------------------------------------------------
   
   - id: open_time_fallback
@@ -1059,8 +1059,9 @@ binary_sensor:
     on_press:
       - script.execute:
           id: jog
-          dir: -1  
+          dir: -1
     on_release:
+      - script.stop: jog
       - script.execute: motor_stop
       - globals.set:
           id: motion_dir
@@ -1141,14 +1142,14 @@ binary_sensor:
       return id(timing_armed);
 
   - platform: template
-    id: diag_gate_ajar
+    id: sensor_gate_ajar
     name: "DIAG Gate Ajar"
     internal: true
     lambda: |-
       return !id(gate_open_switch).state && !id(gate_close_switch).state;
 
   - platform: template
-    id: diag_motor_opening
+    id: sensor_motor_opening
     name: "DIAG Motor Current: Opening"
     internal: true
     lambda: |-
@@ -1156,7 +1157,7 @@ binary_sensor:
       return a > 0.05f;
 
   - platform: template
-    id: diag_motor_closing
+    id: sensor_motor_closing
     name: "DIAG Motor Current: Closing"
     internal: true
     lambda: |-
@@ -1378,6 +1379,7 @@ state_machine:
       #-- Fully closed --
       - name: CLOSED
         on_enter:
+          - script.execute: update_diagnostic_sensors
           - lambda: |-
               if (id(timing_armed)) {
                 id(measured_close_time) = (millis() - id(operation_start_time)) / 1000.0f;
@@ -1604,13 +1606,13 @@ script:
           // Obstacle detection grace period (300ms for inrush current to settle)
           id(obstacle_grace_remaining) = 300;
           
-          // Log fallback warning if timing not yet learned
+          // Warn if timing not yet learned — position tracking will use defaults
           const float eps = 0.001f;
           if (id(motion_dir) == 1 && id(measured_open_time) < eps) {
-            ESP_LOGW("timing", "FALLBACK: Using default open time (%.0fs) - position may be inaccurate", 
+            ESP_LOGW("timing", "Timing not learned: using default open time (%.0fs) - position may be inaccurate",
                      id(open_time_fallback));
           } else if (id(motion_dir) == -1 && id(measured_close_time) < eps) {
-            ESP_LOGW("timing", "FALLBACK: Using default close time (%.0fs) - position may be inaccurate", 
+            ESP_LOGW("timing", "Timing not learned: using default close time (%.0fs) - position may be inaccurate",
                      id(close_time_fallback));
           }
       - script.execute: update_diagnostic_sensors
@@ -1772,7 +1774,7 @@ script:
                   ESP_LOGI("soft_start", "Ramp complete at %.1f%% travel", travel_progress * 100);
                 } else {
                   float ramp_progress = travel_progress / soft_start_zone;
-                  id(pwm_level) = 0.2f + 0.8f * ramp_progress;
+                  id(pwm_level) = 0.2f + 0.8f * ramp_progress;  // 20% floor prevents stall on startup
                 }
             - script.execute: apply_pwm
             - delay: 25ms
@@ -1986,16 +1988,7 @@ script:
                       id: gate_fsm
                       input: CLOSE_CMD
       # Always restore display to HA value when countdown ends for any reason
-      - lambda: |-
-          int duration = 20;
-          if (id(ui_gate_duration).has_state()) {
-            float raw = id(ui_gate_duration).state;
-            if (!isnan(raw) && raw >= 1.0f && raw <= 300.0f) {
-              duration = (int)raw;
-            }
-          }
-          id(gate_close_countdown) = duration;
-          ESP_LOGI("auto_close", "Countdown script ended, display restored to %d", duration);
+      - script.execute: restore_countdown_display
 
   #-----------------------------------------------------------------------------------------
   # cancel_auto_close - Idempotent auto-close cancellation
@@ -2009,7 +2002,16 @@ script:
             ESP_LOGI("auto_close", "Cancelled");
           }
           id(auto_close_active) = false;
-          // Restore display to HA value — never leave it showing 0 when idle
+      - script.execute: restore_countdown_display
+
+  #-----------------------------------------------------------------------------------------
+  # restore_countdown_display - Resets countdown sensor to HA value
+  # Called after countdown ends or is cancelled to clear any partial count
+  #-----------------------------------------------------------------------------------------
+  - id: restore_countdown_display
+    mode: restart
+    then:
+      - lambda: |-
           int duration = 20;
           if (id(ui_gate_duration).has_state()) {
             float raw = id(ui_gate_duration).state;
@@ -2032,7 +2034,6 @@ script:
   #   - 300ms grace period after motor start (inrush current settling)
   #   - Skips while soft start is active (current unreliable at low PWM)
   #   - Threshold increased 15% near endstops (normal mechanical resistance)
-  #     (reduced from 30% in V2 to catch more obstacles near endstops)
   #   - First hit: reverse by configurable distance
   #   - Second hit during reverse: immediate FAULT (hard stop)
   #   - Disabled during timing learning runs
@@ -2079,8 +2080,7 @@ script:
                 if (isnan(current)) return;
                 current = fabsf(current);
 
-                // Calculate threshold with near-endstop adjustment
-                // V2.1: Reduced from 1.30 to 1.15 (err on side of detection)
+                // Calculate threshold with near-endstop adjustment (1.15× within 10% of either endstop)
                 float threshold = id(obstacle_current_threshold);
                 if (pos > 0.90f || pos < 0.10f) {
                   threshold *= 1.15f;
@@ -2165,7 +2165,7 @@ script:
 
 
   #=========================================================================================
-  # SAFETY: MOVEMENT TIMEOUT  (NEW in V2.1)
+  # SAFETY: MOVEMENT TIMEOUT
   #=========================================================================================
 
   #-----------------------------------------------------------------------------------------
@@ -2365,6 +2365,9 @@ script:
       - component.update: sensor_pwm_level
       - component.update: sensor_close_countdown
       - component.update: sensor_obstacle_threshold
+      - component.update: sensor_gate_ajar
+      - component.update: sensor_motor_opening
+      - component.update: sensor_motor_closing
 
 
 #############################################################################################
