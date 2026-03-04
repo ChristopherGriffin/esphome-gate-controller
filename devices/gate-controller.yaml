@@ -481,8 +481,8 @@ esphome:
       - script.execute: check_initial_state
 
 packages:
-  - !include /config/esphome/common/esp_common.yaml
-  - !include /config/esphome/common/wemos_d1_mini32.yaml
+  - !include /config/esphome/repos/gate-controller/packages/esp_common.yaml
+  - !include /config/esphome/repos/gate-controller/packages/wemos_d1_mini32.yaml
 
 #############################################################################################
 # EXTERNAL COMPONENTS

@@ -70,11 +70,16 @@ logger:
   logs:
     light: INFO  # Silence DEBUG spam from status LED glow effect
 
-api:
-  reboot_timeout: 0s
-
 ota:
   platform: esphome
+  password: !secret ota_password
+
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_encryption_key
+  
 
 wifi:
   ssid: !secret wifi_ssid
