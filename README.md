@@ -123,8 +123,8 @@ Check the `substitutions:` block at the top of `devices/gate-controller.yaml` an
 
 ```yaml
 substitutions:
-  device_name: gate-control-v2      # ESPHome device name (lowercase, dashes ok)
-  friendly_name: Gate Control V2    # Display name in Home Assistant
+  device_name: gate-controller      # ESPHome device name (lowercase, dashes ok)
+  friendly_name: Gate Controller    # Display name in Home Assistant
   open_pin: GPIO16                  # PWM output for open direction
   close_pin: GPIO17                 # PWM output for close direction
   i2c_sda: GPIO21
@@ -167,7 +167,7 @@ Create it before flashing (min: 1, max: 300, step: 1, unit: seconds).
 | `number…_obstacle_threshold` | Obstacle detection current threshold (A) |
 | `number…_obstacle_reverse_distance` | How far to reverse on obstacle (%) |
 
-> Entity IDs use the `friendly_name` substitution as a prefix (default: `gate_control_v2`).
+> Entity IDs use the `friendly_name` substitution as a prefix (default: `gate_controller`).
 
 ## FSM States
 

@@ -653,7 +653,7 @@ Note the current learned times before testing.
 
 ## 12 — Home Assistant Entity Audit
 
-Verify every entity is present, labelled correctly, and responsive. The entity prefix matches your **friendly_name** substitution (default: `gate_control_v2`).
+Verify every entity is present, labelled correctly, and responsive. The entity prefix matches your **friendly_name** substitution (default: `gate_controller`).
 
 | Entity | Type | Present | Responds |
 |--------|------|---------|----------|
@@ -757,7 +757,7 @@ Boot the device with no configured WiFi available.
 
 | Check | Expected | Pass |
 |-------|----------|------|
-| SSID visible | `gate-control-v2` | [ ] |
+| SSID visible | `gate-controller` | [ ] |
 | Captive portal at 192.168.4.1 | Yes | [ ] |
 
 ### Scenario 15.5 — OTA firmware update

@@ -329,20 +329,20 @@
 #
 # Entities Exposed:
 #   - cover.gate (with position control)
-#   - sensor.gate_control_v2_state (FSM state)
-#   - sensor.gate_control_v2_gate_position
-#   - sensor.gate_control_v2_learned_open_time
-#   - sensor.gate_control_v2_learned_close_time
-#   - sensor.gate_control_v2_close_countdown
-#   - sensor.gate_control_v2_pwm_level
+#   - sensor.gate_controller_state (FSM state)
+#   - sensor.gate_controller_gate_position
+#   - sensor.gate_controller_learned_open_time
+#   - sensor.gate_controller_learned_close_time
+#   - sensor.gate_controller_close_countdown
+#   - sensor.gate_controller_pwm_level
 #   - sensor.gate_motor_current
 #   - binary_sensor.gate_open_endstop
 #   - binary_sensor.gate_close_endstop
-#   - binary_sensor.gate_control_v2_auto_close_armed
-#   - button.gate_control_v2_reset_learned_times
-#   - button.gate_control_v2_gate_cycle
-#   - number.gate_control_v2_obstacle_threshold
-#   - number.gate_control_v2_obstacle_reverse_distance
+#   - binary_sensor.gate_controller_auto_close_armed
+#   - button.gate_controller_reset_learned_times
+#   - button.gate_controller_gate_cycle
+#   - number.gate_controller_obstacle_threshold
+#   - number.gate_controller_obstacle_reverse_distance
 #
 # Required HA Entity:
 #   - input_number.entry_gate_duration (auto-close countdown duration in seconds)
@@ -394,10 +394,10 @@
 #############################################################################################
 
 substitutions:
-  device_name: gate-control-v2               # Used by esp_common.yaml
+  device_name: gate-controller               # Used by esp_common.yaml
   device_description: "FSM-based gate controller with obstacle detection"
-  name_no_dashes: gate_control_v2
-  friendly_name: Gate Control V2
+  name_no_dashes: gate_controller
+  friendly_name: Gate Controller
   restore_mode_setting: RESTORE_DEFAULT_OFF
 
   # ESP32 GPIO pins
