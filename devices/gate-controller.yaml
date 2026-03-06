@@ -215,7 +215,6 @@
 #    - Skipped while soft start is ramping (current unreliable at low PWM)
 #    - First hit: reverses by configurable distance (default 15%)
 #    - Second hit during reverse: FAULT state (hard stop)
-#    - Disabled during timing learning runs
 #
 # 9. MOVEMENT TIMEOUT
 #    - Watchdog timer based on learned travel time × 1.5
@@ -817,10 +816,6 @@ sensor:
       id: gate_power_sensor_current
       name: "Gate Motor Current"
       accuracy_decimals: 2
-      filters:
-        - sliding_window_moving_average:
-            window_size: 10
-            send_every: 1
 
   #-----------------------------------------------------------------------------------------
   # DIAGNOSTIC SENSORS
@@ -1337,10 +1332,11 @@ state_machine:
       - name: OPEN
         on_enter:
           - script.execute: update_diagnostic_sensors
-          - lambda: |-              
+          - lambda: |-
               if (id(timing_armed)) {
                 id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
+                id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
               }
               id(gate_pos) = 1.0f;
           - script.execute: enter_idle_state
@@ -1356,6 +1352,7 @@ state_machine:
               if (id(timing_armed)) {
                 id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
+                id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
               }
               id(gate_pos) = 1.0f;
           - script.execute: enter_idle_state
@@ -1384,6 +1381,7 @@ state_machine:
               if (id(timing_armed)) {
                 id(measured_close_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned CLOSE time: %.1f seconds", id(measured_close_time));
+                id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
               }
               id(gate_pos) = 0.0f;
           - script.execute: enter_idle_state
@@ -1689,9 +1687,18 @@ script:
           } else {
             ESP_LOGI("obstacle", "Preserving obstacle state during active reversal");
           }
-      - globals.set:
-          id: timing_armed
-          value: 'false'
+      - lambda: |-
+          if (id(timing_armed)) {
+            // timing_armed still set means the run was interrupted before reaching an endstop
+            if (id(motion_dir) == 1) {
+              id(measured_open_time) = 0.0f;
+              ESP_LOGW("timing", "Learning run interrupted — open time reset, clean run required");
+            } else if (id(motion_dir) == -1) {
+              id(measured_close_time) = 0.0f;
+              ESP_LOGW("timing", "Learning run interrupted — close time reset, clean run required");
+            }
+            id(timing_armed) = false;
+          }
       - globals.set:
           id: motion_dir
           value: '0'
@@ -1701,11 +1708,8 @@ script:
       - cover.template.publish:
           id: gate_cover
           current_operation: IDLE
-      - delay: 1s
-      - repeat:
-          count: 10
-          then:
-            - script.execute: update_diagnostic_sensors
+      - delay: 20ms
+      - script.execute: update_diagnostic_sensors
 
 
   #=========================================================================================
@@ -2036,7 +2040,6 @@ script:
   #   - Threshold increased 15% near endstops (normal mechanical resistance)
   #   - First hit: reverse by configurable distance
   #   - Second hit during reverse: immediate FAULT (hard stop)
-  #   - Disabled during timing learning runs
   #-----------------------------------------------------------------------------------------
   - id: obstacle_monitor
     mode: restart
@@ -2055,9 +2058,6 @@ script:
                 const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
                 const bool closing = (st == "CLOSING");
                 if (!opening && !closing) return;
-
-                // Skip during timing learning (needs uninterrupted run)
-                if (id(timing_armed)) return;
 
                 // Grace period: skip checks while inrush current settles
                 if (id(obstacle_grace_remaining) > 0) {
