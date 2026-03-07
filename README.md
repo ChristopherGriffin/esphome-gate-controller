@@ -8,7 +8,7 @@ A feature-rich smart gate/door controller for Home Assistant, built with a Finit
 - **Soft Start / Soft Stop** — smooth motor ramp-up and ramp-down to reduce mechanical stress
 - **Auto-Close** — configurable countdown timer that closes the gate automatically when opened via the cycle button
 - **One-Button (Cycle) Control** — full gate operation from a single momentary button
-- **Hold-to-Operate (Jog)** — direct motor control buttons (dead man's switch) that bypass the FSM
+- **Hold-to-Operate (Jog)** — direct motor control buttons (dead man's switch) that bypass the FSM. Great for gate initial positioning, and testing the endstop function. 
 - **Position Tracking** — time-based position estimation with automatic correction at endstops
 - **Position Control** — move the gate to any position via the Home Assistant cover slider
 - **Timing Learning** — automatically measures full travel time on the first run; persists across reboots
