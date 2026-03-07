@@ -814,8 +814,13 @@ sensor:
     update_interval: never
     current:
       id: gate_power_sensor_current
-      name: "Gate Motor Current"
+      name: "Motor Current"
       accuracy_decimals: 2
+      filters:
+        - median:
+            window_size: 3
+            send_every: 1
+            send_first_at: 1
 
   #-----------------------------------------------------------------------------------------
   # DIAGNOSTIC SENSORS
@@ -823,7 +828,7 @@ sensor:
 
   # Current gate position as percentage
   - platform: template
-    name: "${friendly_name} Gate Position"
+    name: "Position"
     id: sensor_gate_pos
     unit_of_measurement: "%"
     accuracy_decimals: 1
@@ -835,7 +840,7 @@ sensor:
 
   # Timestamps for debugging (internal only)
   - platform: template
-    name: "${friendly_name} Move Start Time"
+    name: "Move Start Time"
     id: sensor_move_start_ms
     unit_of_measurement: "ms"
     accuracy_decimals: 0
@@ -847,7 +852,7 @@ sensor:
     
 
   - platform: template
-    name: "${friendly_name} Move Start Position"
+    name: "Move Start Position"
     id: sensor_move_start_pos
     unit_of_measurement: "%"
     accuracy_decimals: 1
@@ -860,7 +865,7 @@ sensor:
 
   # Learned travel times
   - platform: template
-    name: "${friendly_name} Learned Open Time"
+    name: "Learned Open Time"
     id: sensor_measured_open_time
     unit_of_measurement: "s"
     accuracy_decimals: 1
@@ -870,7 +875,7 @@ sensor:
     update_interval: never
 
   - platform: template
-    name: "${friendly_name} Learned Close Time"
+    name: "Learned Close Time"
     id: sensor_measured_close_time
     unit_of_measurement: "s"
     accuracy_decimals: 1
@@ -880,7 +885,7 @@ sensor:
     update_interval: never
 
   - platform: template
-    name: "${friendly_name} Operation Start Time"
+    name: "Operation Start Time"
     id: sensor_operation_start_time
     unit_of_measurement: "ms"
     accuracy_decimals: 0
@@ -892,7 +897,7 @@ sensor:
 
   # Current PWM duty cycle
   - platform: template
-    name: "${friendly_name} PWM Level"
+    name: "PWM Level"
     id: sensor_pwm_level
     unit_of_measurement: "%"
     accuracy_decimals: 0
@@ -923,7 +928,7 @@ sensor:
 
   # Current auto-close countdown value
   - platform: template
-    name: "${friendly_name} Close Countdown"
+    name: "Close Countdown"
     id: sensor_close_countdown
     unit_of_measurement: "s"
     accuracy_decimals: 0
@@ -935,7 +940,7 @@ sensor:
 
   # Current obstacle threshold (adjusted for position)
   - platform: template
-    name: "${friendly_name} Obstacle Threshold"
+    name: "Obstacle Threshold"
     id: sensor_obstacle_threshold
     unit_of_measurement: "A"
     accuracy_decimals: 2
@@ -964,7 +969,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_open_switch
-    name: "Gate Open Endstop"
+    name: "Open Endstop"
     filters:
       - delayed_on: 10ms
     on_press:
@@ -981,7 +986,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_close_switch
-    name: "Gate Close Endstop"
+    name: "Close Endstop"
     filters:
       - delayed_on: 10ms
     on_press:
@@ -1003,7 +1008,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_cycle_trigger
-    name: "Gate Cycle Trigger"
+    name: "Cycle Trigger"
     filters:
       - delayed_on: 80ms
     on_press:
@@ -1023,7 +1028,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_open_cmd_button
-    name: "Gate OPEN Button"
+    name: "OPEN Button"
     filters:
       - delayed_on: 80ms
     on_press:
@@ -1048,7 +1053,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_close_cmd_button
-    name: "Gate CLOSE Button"
+    name: "CLOSE Button"
     filters:
       - delayed_on: 80ms
     on_press:
@@ -1072,7 +1077,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_stop_button
-    name: "Gate STOP Button"
+    name: "STOP Button"
     filters:
       - delayed_on: 30ms
     on_press:
@@ -1098,7 +1103,7 @@ binary_sensor:
         pullup: true
       inverted: true
     id: gate_reboot_reset_button
-    name: "Gate Reboot/Reset Button"
+    name: "Reboot/Reset Button"
     filters:
       - delayed_on: 80ms
     on_press:
@@ -1129,7 +1134,7 @@ binary_sensor:
   #-----------------------------------------------------------------------------------------
   
   - platform: template
-    name: "${friendly_name} Timing Armed"
+    name: "Timing Armed"
     id: sensor_timing_armed
     icon: "mdi:arm-flex"
     internal: true
@@ -1138,7 +1143,7 @@ binary_sensor:
 
   - platform: template
     id: sensor_gate_ajar
-    name: "DIAG Gate Ajar"
+    name: "Ajar"
     internal: true
     lambda: |-
       return !id(gate_open_switch).state && !id(gate_close_switch).state;
@@ -1160,7 +1165,7 @@ binary_sensor:
       return a < -0.05f;
 
   - platform: template
-    name: "${friendly_name} Soft Start Active"
+    name: "Soft Start Active"
     id: sensor_soft_start_active
     icon: "mdi:rocket-launch"
     internal: true
@@ -1168,7 +1173,7 @@ binary_sensor:
       return id(soft_start_active);
     
   - platform: template
-    name: "${friendly_name} Soft Stop Active"
+    name: "Soft Stop Active"
     id: sensor_soft_stop_active
     icon: "mdi:car-brake-parking"
     internal: true
@@ -1176,14 +1181,14 @@ binary_sensor:
       return id(soft_stop_active);
 
   - platform: template
-    name: "${friendly_name} Auto Close Armed"
+    name: "Auto Close Armed"
     id: sensor_auto_close_active
     icon: "mdi:timer-lock"
     lambda: |-
       return id(auto_close_active);
 
   - platform: template
-    name: "${friendly_name} Obstacle Retry Armed"
+    name: "Obstacle Retry Armed"
     id: sensor_obstacle_retry_armed
     icon: "mdi:alert"
     internal: true
@@ -1191,7 +1196,7 @@ binary_sensor:
       return id(obstacle_retry_armed);
 
   - platform: template
-    name: "${friendly_name} Obstacle Reversing"
+    name: "Ostacle Reversing"
     id: sensor_obstacle_reversing
     icon: "mdi:backup-restore"
     internal: true
@@ -1205,7 +1210,7 @@ binary_sensor:
 button:
   # Clears learned timing data
   - platform: template
-    name: "${friendly_name} Reset Learned Times"
+    name: "Reset Learned Times"
     on_press:
       - globals.set:
           id: measured_open_time
@@ -1221,7 +1226,7 @@ button:
   # GATE CYCLE BUTTON - one-button control
   #-----------------------------------------------------------------------------------------
   - platform: template
-    name: "${friendly_name} Gate Cycle"
+    name: "Cycle"
     id: gate_cycle_button
     on_press:
       - lambda: |-
@@ -1237,7 +1242,7 @@ button:
 number:
   # Adjustable obstacle detection threshold
   - platform: template
-    name: "${friendly_name} Obstacle Threshold"
+    name: "Obstacle Threshold"
     id: num_obstacle_threshold
     min_value: 0.10
     max_value: 2.0
@@ -1258,7 +1263,7 @@ number:
 
   # Adjustable reverse distance
   - platform: template
-    name: "${friendly_name} Obstacle Reverse Distance"
+    name: "Obstacle Reverse Distance"
     id: num_obstacle_reverse_distance
     min_value: 5
     max_value: 50
@@ -1282,7 +1287,7 @@ number:
 
 text_sensor:
   - platform: state_machine
-    name: "${friendly_name} State"
+    name: "State"
     id: gate_fsm_state_text
     state_machine_id: gate_fsm
 
