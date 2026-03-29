@@ -12,7 +12,7 @@
 #   - The FSM owns all state logic and transitions
 #   - The cover component is a thin UI facade that sends commands to the FSM
 #   - Scripts handle discrete tasks (motor control, soft start/stop, position tracking)
-#   - Two intervals: endstop safety watchdog (100ms) and panel LED update (250ms)
+#   - One interval: endstop safety watchdog (100ms); NeoPixel LEDs driven by addressable_lambda effect
 #
 # HARDWARE
 # ========
@@ -27,24 +27,29 @@
 #     GPA5: STOP button (dedicated emergency stop, momentary)
 #     GPA6: Reboot/Reset button (3s hold = reboot, 10s hold = reset times + reboot)
 #     GPA7: (spare)
-#   Port B - LED Outputs:
-#     GPB0: Open LED   - see LED behavior table below
-#     GPB1: Close LED  - see LED behavior table below
-#     GPB2-GPB7: (spare)
+#   Port B - Outputs:
+#     GPB0-GPB7: (all spare - LEDs moved to NeoPixel)
 #
-# LED BEHAVIOR:
-#   State                    OPEN LED (GPB0)          CLOSE LED (GPB1)
-#   OPEN                     Solid                    Off
-#   CLOSED                   Off                      Solid
-#   OPENING / OPENING_CYCLE  Fast flash (2Hz)         Off
-#   CLOSING                  Off                      Fast flash (2Hz)
-#   OPEN_CYCLE (auto-close)  Slow pulse (1Hz)         Off
-#   STOPPED / PAUSED         Fast flash (2Hz)         Fast flash (2Hz)
-#   FAULT                    Solid                    Solid
-#   STOPPED_UNKNOWN (boot)   Alternating fast flash   Alternating fast flash
+# - NeoPixel strip: 2x WS2812B on GPIO27 (LED[0]=Open, LED[1]=Close)
 # - INA260 Current Sensor (address 0x40) - for motor current monitoring
 # - PWM motor driver on GPIO16 (open) and GPIO17 (close)
 # - Power LED wired directly to 3.3V (no GPIO needed)
+#
+# LED BEHAVIOR (NeoPixel - 2 LEDs):
+#   State                  LED[0] Open   LED[1] Close  Pattern
+#   STOPPED_UNKNOWN        White         White          Slow pulse 0.5Hz
+#   OPENING (FSM)          Green         Off            Fast flash 2Hz
+#   OPENING_CYCLE (FSM)    Green         Off            Fast flash 2Hz
+#   OPEN                   Green         Off            Solid
+#   OPEN_CYCLE             Blue          Blue           Slow flash 0.5Hz
+#   CLOSING (FSM)          Off           Red            Fast flash 2Hz
+#   CLOSED                 Off           Red            Solid
+#   PAUSED_FROM_OPENING    Red           Red            Solid
+#   PAUSED_FROM_CLOSING    Red           Red            Solid
+#   STOPPED                Red           Red            Solid
+#   FAULT                  Red/Off       Off/Red        Fast alternating 2Hz
+#   JOG OPEN               Green         Off            Medium flash 1Hz
+#   JOG CLOSE              Off           Red            Medium flash 1Hz
 #
 # ARCHITECTURE
 # ============
@@ -236,10 +241,9 @@
 # 11. CONTROL PANEL
 #     - Standalone operation without PC/phone interface
 #     - 5 buttons: Cycle, Open (hold), Close (hold), Stop, Reboot/Reset
-#     - 7 LEDs: Open endstop, Closed endstop, Opening, Closing, Auto-close, Fault, Stop
+#     - 2x NeoPixel WS2812B (GPIO27): Open indicator, Close indicator
 #     - Power LED hardwired to 3.3V (always on when powered)
-#     - LED state updated every 250ms via polling interval
-#     - Fault LED flashes at 2Hz while in FAULT state
+#     - LED state updated every 125ms via addressable_lambda effect
 #     - Reboot/Reset button: 3s hold = reboot, 10s hold = reset times + reboot
 #
 # GLOBALS REFERENCE
@@ -282,7 +286,6 @@
 #
 # Panel Controls:
 #   reboot_btn_press_ms - Timestamp when reboot/reset button was pressed
-#   led_tick            - Tick counter for LED flash pattern timing
 #
 # SCRIPTS REFERENCE
 # =================
@@ -321,7 +324,7 @@
 #
 # Intervals:
 #   100ms - Endstop safety watchdog (kills motor if endstop active during motion)
-#   250ms - Panel LED update (reads state, drives all 7 LEDs)
+#   125ms - NeoPixel LED update (via addressable_lambda effect on panel_leds light)
 #
 # HOME ASSISTANT INTEGRATION
 # ==========================
@@ -400,10 +403,11 @@ substitutions:
   restore_mode_setting: RESTORE_DEFAULT_OFF
 
   # ESP32 GPIO pins
-  open_pin:  GPIO16     # PWM output for opening motor direction
-  close_pin: GPIO17     # PWM output for closing motor direction
-  i2c_sda:   GPIO21     # I2C data line (MCP23017 + INA260)
-  i2c_scl:   GPIO22     # I2C clock line
+  open_pin:      GPIO16     # PWM output for opening motor direction
+  close_pin:     GPIO17     # PWM output for closing motor direction
+  i2c_sda:       GPIO21     # I2C data line (MCP23017 + INA260)
+  i2c_scl:       GPIO22     # I2C clock line
+  neopixel_pin:  GPIO33     # NeoPixel data line (2x WS2812B panel LEDs)
 
   # I2C peripheral addresses (change if address pins are wired differently)
   mcp23017_address: "0x20"   # MCP23017 GPIO expander  (A0-A2 pins set this)
@@ -420,9 +424,7 @@ substitutions:
   #   GPA6 (pin  6) : Reboot/Reset button
   #   GPA7 (pin  7) : spare
   # Port B - Outputs:
-  #   GPB0 (pin  8) : Open LED
-  #   GPB1 (pin  9) : Close LED
-  #   GPB2-GPB7     : spare
+  #   GPB0-GPB7     : spare (LEDs moved to NeoPixel on GPIO27)
 
 #############################################################################################
 # ESPHOME CORE CONFIGURATION
@@ -439,6 +441,9 @@ esphome:
   compile_process_limit: 1
   on_boot:                                    # Merges with hardware package's on_boot (update_status_led)
     then:
+      - light.turn_on:
+          id: panel_leds
+          effect: "FSM State"
       - script.execute: check_initial_state
 
 packages:
@@ -504,50 +509,6 @@ interval:
             id(gate_control_gate_close).set_level(0.0f);
           }
 
-  #-----------------------------------------------------------------------------------------
-  # PANEL LED UPDATE - 250ms
-  # Drives OPEN LED (GPB0) and CLOSE LED (GPB1) based on FSM state and motion direction.
-  # motion_dir is checked first so jog mode is reflected correctly.
-  #
-  # Fast flash (2Hz) : led_tick % 2 == 0  →  250ms on / 250ms off
-  # Slow pulse (1Hz) : led_tick % 4 < 2   →  500ms on / 500ms off
-  # Alternating      : OPEN = fast, CLOSE = !fast  (A on when B off)
-  #-----------------------------------------------------------------------------------------
-  - interval: 250ms
-    then:
-      - lambda: |-
-          id(led_tick)++;
-          if (id(led_tick) >= 8) id(led_tick) = 0;
-
-          const bool fast = (id(led_tick) % 2 == 0);
-          const bool slow = (id(led_tick) % 4 < 2);
-
-          const int dir = id(motion_dir);
-          const std::string st = id(gate_fsm_state_text).state;
-
-          bool open_led = false;
-          bool close_led = false;
-
-          if (st == "FAULT") {
-            open_led = true; close_led = true;                   // Both solid
-          } else if (dir == 1) {
-            open_led = fast; close_led = false;                  // Opening (FSM or jog)
-          } else if (dir == -1) {
-            open_led = false; close_led = fast;                  // Closing (FSM or jog)
-          } else if (st == "OPEN_CYCLE") {
-            open_led = slow; close_led = false;                  // Auto-close countdown
-          } else if (st == "OPEN") {
-            open_led = true; close_led = false;                  // At open endstop
-          } else if (st == "CLOSED") {
-            open_led = false; close_led = true;                  // At close endstop
-          } else if (st == "STOPPED" || st == "PAUSED_FROM_OPENING" || st == "PAUSED_FROM_CLOSING") {
-            open_led = fast; close_led = fast;                   // Stopped mid-travel
-          } else {
-            open_led = fast; close_led = !fast;                  // STOPPED_UNKNOWN: alternating
-          }
-
-          id(led_open).set_state(open_led);
-          id(led_close).set_state(close_led);
 
 #############################################################################################
 # I2C BUS CONFIGURATION
@@ -557,7 +518,7 @@ i2c:
   sda: ${i2c_sda}
   scl: ${i2c_scl}
   scan: true
-  frequency: 10khz
+  frequency: 100khz
 
 #############################################################################################
 # GPIO EXPANDER
@@ -755,13 +716,24 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  # Tick counter for LED flash patterns (increments every 250ms)
-  # fast flash (2Hz): tick % 2 == 0   → 250ms on / 250ms off
-  # slow pulse (1Hz): tick % 4 < 2    → 500ms on / 500ms off
-  - id: led_tick
-    type: uint8_t
-    restore_value: no
-    initial_value: "0"
+  #-----------------------------------------------------------------------------------------
+  # POSITION CORRECTION FACTORS
+  #-----------------------------------------------------------------------------------------
+  # Adaptive multipliers applied to base travel time in position tracking.
+  # Compensates for soft start/stop slowing actual travel vs the full-speed timing run.
+  # Updated via EMA (alpha=0.3) each time a full endstop-to-endstop run completes.
+  # Converges to accurate values after ~5-6 runs. Persists across reboots.
+  # Reset along with learned times via the Reset Learned Times button.
+  - id: position_correction_open
+    type: float
+    restore_value: yes
+    initial_value: "1.0"
+
+  - id: position_correction_close
+    type: float
+    restore_value: yes
+    initial_value: "1.0"
+
 
 #############################################################################################
 # PWM OUTPUTS
@@ -780,25 +752,101 @@ output:
     frequency: 20000Hz
     id: gate_control_gate_close
 
-  #-----------------------------------------------------------------------------------------
-  # PANEL LEDs (MCP23017 GPB0-GPB1)
-  #-----------------------------------------------------------------------------------------
+#############################################################################################
+# PANEL LEDS - NeoPixel
+#############################################################################################
+# Two WS2812B LEDs on GPIO33: LED[0] = Open indicator, LED[1] = Close indicator.
+# The addressable_lambda effect runs every main loop iteration (update_interval: 0ms).
+# Blink phase is derived from millis() (wall clock). I2S DMA is only triggered
+# when the color actually changes — no per-loop overhead for solid/idle states.
+#   fast   (2Hz): (ms/250)%2  →  250ms on / 250ms off
+#   medium (1Hz): (ms/500)%2  →  500ms on / 500ms off
+#   slow (0.5Hz): (ms/1000)%2 → 1000ms on / 1000ms off
+# Jog vs FSM motion: when motion_dir != 0, FSM state distinguishes jog (not in a motion state)
+# from commanded motion (OPENING / OPENING_CYCLE / CLOSING).
+#############################################################################################
 
-  - platform: gpio
-    id: led_open
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 8          # GPB0
-      mode: output
-      inverted: false
+light:
+  - platform: neopixelbus
+    id: panel_leds
+    type: GBR
+    variant: WS2812
+    pin: ${neopixel_pin}
+    num_leds: 2
+    method: ESP32_I2S_0  # Avoids RMT (deprecated on ESP-IDF 5.x); I2S DMA is PWM-independent
+    internal: true
+    default_transition_length: 0ms
+    effects:
+      - addressable_lambda:
+          name: "FSM State"
+          update_interval: 0ms
+          lambda: |-
+            // Runs every main loop iteration (update_interval: 0ms).
+            // millis() gives the correct blink phase regardless of loop speed.
+            // I2S DMA is only triggered when color actually changes, so there
+            // is no per-loop transmission overhead for solid or unchanged states.
+            const uint32_t ms = millis();
+            const bool fast   = (ms / 250)  % 2 == 0;  // 2Hz    250ms on/off
+            const bool medium = (ms / 500)  % 2 == 0;  // 1Hz    500ms on/off
+            const bool slow   = (ms / 1000) % 2 == 0;  // 0.5Hz 1000ms on/off
 
-  - platform: gpio
-    id: led_close
-    pin:
-      mcp23xxx: gate_io_expander
-      number: 9          # GPB1
-      mode: output
-      inverted: false
+            const int dir = id(motion_dir);
+            const std::string st = id(gate_fsm_state_text).state;
+
+            const esphome::Color OFF   = {0,   0,   0};
+            const esphome::Color RED   = {255, 0,   0};
+            const esphome::Color GREEN = {0,   255, 0};
+            const esphome::Color BLUE  = {0,   0,   255};
+            const esphome::Color WHITE = {255, 255, 255};
+
+            esphome::Color open_col = OFF;
+            esphome::Color close_col = OFF;
+
+            if (st == "FAULT") {
+              // Red bounces between LEDs at 4Hz
+              open_col  = fast ? RED : OFF;
+              close_col = fast ? OFF : RED;
+            } else if (dir == 1) {
+              bool fsm_motion = (st == "OPENING" || st == "OPENING_CYCLE");
+              esphome::Color c = (fsm_motion ? fast : medium) ? GREEN : OFF;
+              open_col  = c;
+              close_col = OFF;
+            } else if (dir == -1) {
+              bool fsm_motion = (st == "CLOSING");
+              esphome::Color c = (fsm_motion ? fast : medium) ? RED : OFF;
+              open_col  = OFF;
+              close_col = c;
+            } else if (st == "OPEN_CYCLE") {
+              esphome::Color c = slow ? BLUE : OFF;
+              open_col  = c;
+              close_col = c;
+            } else if (st == "OPEN") {
+              open_col  = GREEN;
+              close_col = OFF;
+            } else if (st == "CLOSED") {
+              open_col  = OFF;
+              close_col = RED;
+            } else if (st == "PAUSED_FROM_OPENING" || st == "PAUSED_FROM_CLOSING" || st == "STOPPED") {
+              open_col  = RED;
+              close_col = RED;
+            } else {
+              // STOPPED_UNKNOWN (boot) - both white slow pulse
+              esphome::Color c = slow ? WHITE : OFF;
+              open_col  = c;
+              close_col = c;
+            }
+
+            // Only write to I2S DMA when color actually changes.
+            // Not assigning to it[0]/it[1] leaves the pixel buffer clean,
+            // suppressing the I2S transmission for that loop iteration.
+            static esphome::Color prev_open  = {255, 0, 255};  // magenta forces first write
+            static esphome::Color prev_close = {255, 0, 255};
+            if (open_col != prev_open || close_col != prev_close) {
+              it[0] = open_col;
+              it[1] = close_col;
+              prev_open  = open_col;
+              prev_close = close_col;
+            }
 
 #############################################################################################
 # SENSORS
@@ -821,6 +869,7 @@ sensor:
             window_size: 3
             send_every: 1
             send_first_at: 1
+        - delta: 0.05
 
   #-----------------------------------------------------------------------------------------
   # DIAGNOSTIC SENSORS
@@ -905,6 +954,8 @@ sensor:
     lambda: |-
       return id(pwm_level) * 100.0f;
     update_interval: never
+    filters:
+      - delta: 1.0
   #-----------------------------------------------------------------------------------------
   # AUTO-CLOSE SENSORS
   #-----------------------------------------------------------------------------------------
@@ -1218,7 +1269,13 @@ button:
       - globals.set:
           id: measured_close_time
           value: '0.0'
-      - logger.log: "Learned times reset to 0"
+      - globals.set:
+          id: position_correction_open
+          value: '1.0'
+      - globals.set:
+          id: position_correction_close
+          value: '1.0'
+      - logger.log: "Learned times and position corrections reset"
       # Force immediate sensor update (normally 5s interval)
       - script.execute: update_diagnostic_sensors
 
@@ -1342,6 +1399,14 @@ state_machine:
                 id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
                 id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
+              } else if (id(measured_open_time) > 1.0f && id(move_start_pos) < 0.1f) {
+                float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
+                float new_corr = T_actual / id(measured_open_time);
+                if (new_corr > 0.5f && new_corr < 3.0f) {
+                  id(position_correction_open) = 0.7f * id(position_correction_open) + 0.3f * new_corr;
+                  ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
+                           id(position_correction_open), T_actual, id(measured_open_time));
+                }
               }
               id(gate_pos) = 1.0f;
           - script.execute: enter_idle_state
@@ -1358,6 +1423,14 @@ state_machine:
                 id(measured_open_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned OPEN time: %.1f seconds", id(measured_open_time));
                 id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
+              } else if (id(measured_open_time) > 1.0f && id(move_start_pos) < 0.1f) {
+                float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
+                float new_corr = T_actual / id(measured_open_time);
+                if (new_corr > 0.5f && new_corr < 3.0f) {
+                  id(position_correction_open) = 0.7f * id(position_correction_open) + 0.3f * new_corr;
+                  ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
+                           id(position_correction_open), T_actual, id(measured_open_time));
+                }
               }
               id(gate_pos) = 1.0f;
           - script.execute: enter_idle_state
@@ -1387,6 +1460,14 @@ state_machine:
                 id(measured_close_time) = (millis() - id(operation_start_time)) / 1000.0f;
                 ESP_LOGI("timing", "Learned CLOSE time: %.1f seconds", id(measured_close_time));
                 id(timing_armed) = false;  // Clear here so enter_idle_state knows run completed
+              } else if (id(measured_close_time) > 1.0f && id(move_start_pos) > 0.9f) {
+                float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
+                float new_corr = T_actual / id(measured_close_time);
+                if (new_corr > 0.5f && new_corr < 3.0f) {
+                  id(position_correction_close) = 0.7f * id(position_correction_close) + 0.3f * new_corr;
+                  ESP_LOGI("position", "Close correction: %.3f (actual=%.1fs base=%.1fs)",
+                           id(position_correction_close), T_actual, id(measured_close_time));
+                }
               }
               id(gate_pos) = 0.0f;
           - script.execute: enter_idle_state
@@ -1663,7 +1744,7 @@ script:
             id(gate_control_gate_open).set_level(0.0f);
             id(gate_control_gate_close).set_level(0.0f);
           }
-      - script.execute: update_diagnostic_sensors
+      - component.update: sensor_pwm_level
 
 
   #=========================================================================================
@@ -1832,25 +1913,27 @@ script:
                 const float destination = has_target ? target : (opening ? 1.0f : 0.0f);
                 const float distance_remaining = fabsf(destination - pos);
                 
-                // Position targets need wider ramp zone for gentle deceleration
-                // (no physical switch to absorb impact, must stop on position alone)
-                // Endstop approaches use narrow zone (physical switch does the stopping)
-                const float ramp_zone = has_target ? 0.05f : 0.01f;   // 5% position / 1% endstop
-                const float stop_zone = 0.005f;                        // 0.5% stop threshold
+                // Position targets: 5% ramp zone, must stop on position alone (no physical switch)
+                // Endstop approaches: 5% ramp zone, decelerates to 45% by estimated position 0%,
+                //   then holds 45% until physical switch fires
+                const float ramp_zone = has_target ? 0.05f : 0.05f;
+                const float stop_zone = 0.005f;                        // 0.5% stop threshold (position targets only)
                 const float min_pwm = has_target ? 0.30f : 0.45f;     // 30% position / 45% endstop
-                
+
                 // Enter soft stop zone
                 if (distance_remaining <= ramp_zone && !id(soft_stop_active)) {
                   id(soft_stop_active) = true;
-                  ESP_LOGI("soft_stop", "Entering zone at %.1f%% (dest: %.1f%%)", 
+                  ESP_LOGI("soft_stop", "Entering zone at %.1f%% (dest: %.1f%%)",
                            pos * 100, destination * 100);
                 }
-                
-                // Ramp down PWM
+
+                // Ramp down PWM using quadratic curve — stays near full speed longer,
+                // only drops steeply near the end of the zone
                 if (id(soft_stop_active)) {
                   float ramp_progress = 1.0f - (distance_remaining / ramp_zone);
+                  if (ramp_progress < 0.0f) ramp_progress = 0.0f;
                   if (ramp_progress > 1.0f) ramp_progress = 1.0f;
-                  float p = 1.0f - (1.0f - min_pwm) * ramp_progress;
+                  float p = 1.0f - (1.0f - min_pwm) * (ramp_progress * ramp_progress);
                   if (p < min_pwm) p = min_pwm;
                   id(pwm_level) = p;
                 }
@@ -1889,10 +1972,12 @@ script:
                 const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
                 
                 const float eps = 0.001f;
-                const float total =
+                const float base_time =
                   opening
                     ? ((id(measured_open_time) > eps) ? id(measured_open_time) : id(open_time_fallback))
                     : ((id(measured_close_time) > eps) ? id(measured_close_time) : id(close_time_fallback));
+                const float correction = opening ? id(position_correction_open) : id(position_correction_close);
+                const float total = base_time * correction;
 
                 if (total <= eps) return;
 
@@ -1904,14 +1989,14 @@ script:
                 if (pos > 1.0f) pos = 1.0f;
 
                 id(gate_pos) = pos;
-                
-                // Publish every 4th cycle (~100ms) to reduce traffic
-                id(publish_counter)++;
-                if (id(publish_counter) >= 4) {
-                  id(publish_counter) = 0;
-                  id(gate_cover).publish_state(pos);
+
+                // Publish only when position changes by >= 1%
+                float last = id(publish_counter) / 100.0f;  // reuse counter as last-published (×100)
+                if (fabsf(pos - last) >= 0.01f) {
+                  id(publish_counter) = (uint8_t)(pos * 100.0f);
+                  id(gate_cover).position = pos;
+                  id(gate_cover).publish_state();
                   id(sensor_gate_pos).publish_state(pos * 100.0f);
-                  
                 }
             - delay: 25ms
       - logger.log: "Position tracking stopped"
@@ -2057,7 +2142,7 @@ script:
               const std::string st = id(gate_fsm_state_text).state;
               return (st == "OPENING") || (st == "OPENING_CYCLE") || (st == "CLOSING");
           then:
-            - script.execute: update_diagnostic_sensors
+            - component.update: gate_power_sensor
             - lambda: |-
                 const std::string st = id(gate_fsm_state_text).state;
                 const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
@@ -2390,9 +2475,6 @@ cover:
     device_class: gate
     has_position: true
     optimistic: false
-
-    lambda: |-
-      return id(gate_pos);
 
     open_action:
       - logger.log: "Cover: OPEN_CMD"

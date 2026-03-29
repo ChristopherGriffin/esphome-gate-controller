@@ -24,7 +24,7 @@
 # LED BEHAVIOR (GPIO2 - onboard blue LED):
 #   Fast blink (0.5s) : WiFi disconnected
 #   Solid ON          : WiFi connected, API disconnected
-#   Slow glow (2s)    : WiFi connected, API connected
+#   Slow pulse (2s)   : WiFi connected, API connected
 #
 # USAGE:
 #   packages:
@@ -59,7 +59,8 @@ output:
   - platform: ledc
     id: status_led_output
     pin: ${status_led_pin}
-    frequency: 1000Hz
+    frequency: 10Hz
+    inverted: true
 
 #------------------------------------------------------------------------------
 # Status LED Light Component
@@ -81,18 +82,12 @@ light:
             - state: false
               duration: 500ms
       # Slow glow for fully connected (WiFi + API)
-      - lambda:
+      - pulse:
           name: "Slow Glow"
-          update_interval: 40ms
-          lambda: |-
-            static float phase = 0;
-            phase += 0.05;  // ~2s full cycle (50 steps * 40ms * 2)
-            if (phase > 3.14159) phase = -3.14159;
-            float brightness = (sin(phase) + 1.0) / 2.0;  // 0.0 to 1.0
-            auto call = id(status_led).turn_on();
-            call.set_brightness(brightness);
-            call.set_transition_length(0);
-            call.perform();
+          transition_length: 1000ms
+          update_interval: 50ms
+          min_brightness: 5%
+          max_brightness: 100%
 
 #------------------------------------------------------------------------------
 # Status LED Control Script
