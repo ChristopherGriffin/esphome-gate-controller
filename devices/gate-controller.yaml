@@ -413,6 +413,39 @@ substitutions:
   mcp23017_address: "0x20"   # MCP23017 GPIO expander  (A0-A2 pins set this)
   ina260_address:   "0x40"   # INA260 current sensor    (VS  pin  sets this)
 
+  # ---------------------------------------------------------------------------
+  # TUNABLE MOTION PARAMETERS
+  # ---------------------------------------------------------------------------
+  # These are compile-time defaults. To expose any of these to Home Assistant
+  # for runtime adjustment without reflashing:
+  #   1. Move the value into a globals entry (type: float, restore_value: yes)
+  #   2. Add a matching number: platform: template entity with set_action
+  #   3. Replace ${substitution} references in lambdas with id(global_name)
+  # ---------------------------------------------------------------------------
+
+  # Position correction EMA learning rate.
+  # Controls how quickly the adaptive correction converges after each full run.
+  # Lower = more stable but slower to adapt. Higher = faster but more sensitive to outliers.
+  #   0.1 = very slow (~20 runs to converge)
+  #   0.3 = conservative (~10 runs)
+  #   0.5 = moderate (~5 runs)  ← current default
+  #   0.9 = aggressive (~2 runs, reacts strongly to single outlier)
+  pos_correction_ema_alpha: "0.5f"
+
+  # Soft start zone: fraction of total travel over which PWM ramps 20%→100% at the start.
+  # Also used as the handoff threshold to soft stop if destination is close.
+  #   0.05 = 5%   (short ramp, less mechanical cushioning)
+  #   0.10 = 10%  ← current default
+  #   0.20 = 20%  (long ramp, very gentle start)
+  soft_start_zone: "0.10f"
+
+  # Soft stop zone: fraction of total travel over which PWM ramps 100%→min at the end.
+  # Applies to both endstop approaches and position target stops.
+  #   0.03 = 3%   (short ramp, stops faster)
+  #   0.05 = 5%   ← current default
+  #   0.10 = 10%  (long ramp, very gentle stop)
+  soft_stop_zone: "0.05f"
+
   # MCP23017 wiring reference (pin numbers defined inline next to each sensor/output)
   # Port A - Inputs, active low, internal pullup:
   #   GPA0 (pin  0) : Open endstop switch
@@ -1403,7 +1436,7 @@ state_machine:
                 float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
                 float new_corr = T_actual / id(measured_open_time);
                 if (new_corr > 0.5f && new_corr < 3.0f) {
-                  id(position_correction_open) = 0.7f * id(position_correction_open) + 0.3f * new_corr;
+                  id(position_correction_open) = (1.0f - ${pos_correction_ema_alpha}) * id(position_correction_open) + ${pos_correction_ema_alpha} * new_corr;
                   ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_open), T_actual, id(measured_open_time));
                 }
@@ -1427,7 +1460,7 @@ state_machine:
                 float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
                 float new_corr = T_actual / id(measured_open_time);
                 if (new_corr > 0.5f && new_corr < 3.0f) {
-                  id(position_correction_open) = 0.7f * id(position_correction_open) + 0.3f * new_corr;
+                  id(position_correction_open) = (1.0f - ${pos_correction_ema_alpha}) * id(position_correction_open) + ${pos_correction_ema_alpha} * new_corr;
                   ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_open), T_actual, id(measured_open_time));
                 }
@@ -1464,7 +1497,7 @@ state_machine:
                 float T_actual = (millis() - id(move_start_ms)) / 1000.0f;
                 float new_corr = T_actual / id(measured_close_time);
                 if (new_corr > 0.5f && new_corr < 3.0f) {
-                  id(position_correction_close) = 0.7f * id(position_correction_close) + 0.3f * new_corr;
+                  id(position_correction_close) = (1.0f - ${pos_correction_ema_alpha}) * id(position_correction_close) + ${pos_correction_ema_alpha} * new_corr;
                   ESP_LOGI("position", "Close correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_close), T_actual, id(measured_close_time));
                 }
@@ -1835,16 +1868,16 @@ script:
                   return;
                 }
                 
-                const float soft_start_zone = 0.10f;  // 10% of full travel
-                
+                const float soft_start_zone = ${soft_start_zone};
+
                 const float target = id(position_target);
                 const bool has_target = (target >= 0.0f);
                 const float destination = has_target
-                  ? target 
+                  ? target
                   : (opening ? 1.0f : 0.0f);
-                
+
                 // Handoff threshold matches soft_stop ramp zone
-                const float soft_stop_zone = has_target ? 0.05f : 0.01f;
+                const float soft_stop_zone = ${soft_stop_zone};
                 
                 const float distance_remaining = fabsf(destination - id(gate_pos));
                 const float travel_progress = fabsf(id(gate_pos) - id(move_start_pos));
@@ -1916,7 +1949,7 @@ script:
                 // Position targets: 5% ramp zone, must stop on position alone (no physical switch)
                 // Endstop approaches: 5% ramp zone, decelerates to 45% by estimated position 0%,
                 //   then holds 45% until physical switch fires
-                const float ramp_zone = has_target ? 0.05f : 0.05f;
+                const float ramp_zone = ${soft_stop_zone};
                 const float stop_zone = 0.005f;                        // 0.5% stop threshold (position targets only)
                 const float min_pwm = has_target ? 0.30f : 0.45f;     // 30% position / 45% endstop
 
@@ -1993,7 +2026,7 @@ script:
                 // Publish only when position changes by >= 1%
                 float last = id(publish_counter) / 100.0f;  // reuse counter as last-published (×100)
                 if (fabsf(pos - last) >= 0.01f) {
-                  id(publish_counter) = (uint8_t)(pos * 100.0f);
+                  id(publish_counter) = (uint8_t)roundf(pos * 100.0f);
                   id(gate_cover).position = pos;
                   id(gate_cover).publish_state();
                   id(sensor_gate_pos).publish_state(pos * 100.0f);
