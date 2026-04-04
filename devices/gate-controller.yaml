@@ -752,10 +752,45 @@ globals:
   #-----------------------------------------------------------------------------------------
   # POSITION CORRECTION FACTORS
   #-----------------------------------------------------------------------------------------
+  #-----------------------------------------------------------------------------------------
+  # VOLTAGE-BASED POSITION COMPENSATION
+  #-----------------------------------------------------------------------------------------
+  # Motor speed ∝ supply voltage. These track average voltage per full run and apply
+  # a real-time scaling factor to position tracking: volt_factor = ref_V / current_V.
+  # total_effective = base_time × ema_correction × volt_factor
+  #
+  # EMA correction handles systematic offsets (soft start/stop, motor characteristics).
+  # Voltage factor handles dynamic changes (battery depletion/charge) within a run.
+  # Both update at the same EMA alpha so they stay in sync.
+  # Sanity bounds: 9–16V. Factor clamped ±30%. First run = direct assignment.
+  # Reset alongside learned times via Reset Learned Times button.
+  - id: ref_voltage_open
+    type: float
+    restore_value: yes
+    initial_value: "0.0"   # 0.0 = unlearned → direct assignment on first qualifying run
+
+  - id: ref_voltage_close
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # Per-run voltage accumulators — reset by motor_start, consumed by endstop state handlers
+  - id: run_voltage_sum
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  - id: run_voltage_count
+    type: uint16_t
+    restore_value: no
+    initial_value: "0"
+
+  #-----------------------------------------------------------------------------------------
+  # POSITION CORRECTION FACTORS (EMA — soft start/stop compensation)
+  #-----------------------------------------------------------------------------------------
   # Adaptive multipliers applied to base travel time in position tracking.
-  # Compensates for soft start/stop slowing actual travel vs the full-speed timing run.
-  # Updated via EMA (alpha=0.3) each time a full endstop-to-endstop run completes.
-  # Converges to accurate values after ~5-6 runs. Persists across reboots.
+  # Updated via EMA each time a full endstop-to-endstop run completes.
+  # Converges to accurate values after ~5 runs. Persists across reboots.
   # Reset along with learned times via the Reset Learned Times button.
   - id: position_correction_open
     type: float
@@ -903,6 +938,13 @@ sensor:
             send_every: 1
             send_first_at: 1
         - delta: 0.05
+    bus_voltage:
+      id: gate_supply_voltage
+      name: "Supply Voltage"
+      accuracy_decimals: 2
+      unit_of_measurement: "V"
+      icon: "mdi:battery"
+      
 
   #-----------------------------------------------------------------------------------------
   # DIAGNOSTIC SENSORS
@@ -1308,7 +1350,13 @@ button:
       - globals.set:
           id: position_correction_close
           value: '1.0'
-      - logger.log: "Learned times and position corrections reset"
+      - globals.set:
+          id: ref_voltage_open
+          value: '0.0'
+      - globals.set:
+          id: ref_voltage_close
+          value: '0.0'
+      - logger.log: "Learned times, position corrections, and voltage references reset"
       # Force immediate sensor update (normally 5s interval)
       - script.execute: update_diagnostic_sensors
 
@@ -1440,6 +1488,19 @@ state_machine:
                   ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_open), T_actual, id(measured_open_time));
                 }
+                // Update reference voltage (EMA-paired with correction, same alpha)
+                if (id(run_voltage_count) >= 10) {
+                  float avg_v = id(run_voltage_sum) / id(run_voltage_count);
+                  if (avg_v > 9.0f && avg_v < 16.0f) {
+                    if (id(ref_voltage_open) < 1.0f) {
+                      id(ref_voltage_open) = avg_v;  // First run: direct assignment
+                    } else {
+                      id(ref_voltage_open) = (1.0f - ${pos_correction_ema_alpha}) * id(ref_voltage_open) + ${pos_correction_ema_alpha} * avg_v;
+                    }
+                    ESP_LOGI("voltage", "Open ref voltage: %.2fV (avg=%.2fV, n=%d)",
+                             id(ref_voltage_open), avg_v, (int)id(run_voltage_count));
+                  }
+                }
               }
               id(gate_pos) = 1.0f;
           - script.execute: enter_idle_state
@@ -1463,6 +1524,18 @@ state_machine:
                   id(position_correction_open) = (1.0f - ${pos_correction_ema_alpha}) * id(position_correction_open) + ${pos_correction_ema_alpha} * new_corr;
                   ESP_LOGI("position", "Open correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_open), T_actual, id(measured_open_time));
+                }
+                if (id(run_voltage_count) >= 10) {
+                  float avg_v = id(run_voltage_sum) / id(run_voltage_count);
+                  if (avg_v > 9.0f && avg_v < 16.0f) {
+                    if (id(ref_voltage_open) < 1.0f) {
+                      id(ref_voltage_open) = avg_v;
+                    } else {
+                      id(ref_voltage_open) = (1.0f - ${pos_correction_ema_alpha}) * id(ref_voltage_open) + ${pos_correction_ema_alpha} * avg_v;
+                    }
+                    ESP_LOGI("voltage", "Open ref voltage: %.2fV (avg=%.2fV, n=%d)",
+                             id(ref_voltage_open), avg_v, (int)id(run_voltage_count));
+                  }
                 }
               }
               id(gate_pos) = 1.0f;
@@ -1500,6 +1573,18 @@ state_machine:
                   id(position_correction_close) = (1.0f - ${pos_correction_ema_alpha}) * id(position_correction_close) + ${pos_correction_ema_alpha} * new_corr;
                   ESP_LOGI("position", "Close correction: %.3f (actual=%.1fs base=%.1fs)",
                            id(position_correction_close), T_actual, id(measured_close_time));
+                }
+                if (id(run_voltage_count) >= 10) {
+                  float avg_v = id(run_voltage_sum) / id(run_voltage_count);
+                  if (avg_v > 9.0f && avg_v < 16.0f) {
+                    if (id(ref_voltage_close) < 1.0f) {
+                      id(ref_voltage_close) = avg_v;
+                    } else {
+                      id(ref_voltage_close) = (1.0f - ${pos_correction_ema_alpha}) * id(ref_voltage_close) + ${pos_correction_ema_alpha} * avg_v;
+                    }
+                    ESP_LOGI("voltage", "Close ref voltage: %.2fV (avg=%.2fV, n=%d)",
+                             id(ref_voltage_close), avg_v, (int)id(run_voltage_count));
+                  }
                 }
               }
               id(gate_pos) = 0.0f;
@@ -1686,7 +1771,9 @@ script:
           // Position tracking setup
           id(move_start_ms) = millis();
           id(move_start_pos) = id(gate_pos);
-          id(publish_counter) = 0;  // Reset publish throttle
+          id(publish_counter) = 0;    // Reset publish throttle
+          id(run_voltage_sum) = 0.0f; // Reset voltage accumulator for this run
+          id(run_voltage_count) = 0;
           
           // Timing arm logic
           bool timing_just_armed = false;
@@ -2010,7 +2097,17 @@ script:
                     ? ((id(measured_open_time) > eps) ? id(measured_open_time) : id(open_time_fallback))
                     : ((id(measured_close_time) > eps) ? id(measured_close_time) : id(close_time_fallback));
                 const float correction = opening ? id(position_correction_open) : id(position_correction_close);
-                const float total = base_time * correction;
+                // Voltage factor: compensates for battery state changes in real-time
+                // ref_V < 1.0 means not yet learned — factor stays 1.0
+                float volt_factor = 1.0f;
+                const float ref_v = opening ? id(ref_voltage_open) : id(ref_voltage_close);
+                const float cur_v = id(gate_supply_voltage).state;
+                if (ref_v > 9.0f && !isnan(cur_v) && cur_v > 9.0f && cur_v < 16.0f) {
+                  volt_factor = ref_v / cur_v;
+                  if (volt_factor < 0.7f) volt_factor = 0.7f;
+                  if (volt_factor > 1.3f) volt_factor = 1.3f;
+                }
+                const float total = base_time * correction * volt_factor;
 
                 if (total <= eps) return;
 
@@ -2177,6 +2274,16 @@ script:
           then:
             - component.update: gate_power_sensor
             - lambda: |-
+                // Accumulate supply voltage for reference learning — full speed only.
+                // Exclude soft start and soft stop: reduced motor load raises bus voltage,
+                // which would skew the reference and underestimate battery depletion.
+                float v = id(gate_supply_voltage).state;
+                if (!isnan(v) && v > 9.0f && v < 16.0f
+                    && !id(soft_start_active) && !id(soft_stop_active)) {
+                  id(run_voltage_sum) += v;
+                  id(run_voltage_count)++;
+                }
+
                 const std::string st = id(gate_fsm_state_text).state;
                 const bool opening = (st == "OPENING" || st == "OPENING_CYCLE");
                 const bool closing = (st == "CLOSING");
