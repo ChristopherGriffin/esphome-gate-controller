@@ -60,7 +60,6 @@ output:
     id: status_led_output
     pin: ${status_led_pin}
     frequency: 10Hz
-    inverted: true
 
 #------------------------------------------------------------------------------
 # Status LED Light Component

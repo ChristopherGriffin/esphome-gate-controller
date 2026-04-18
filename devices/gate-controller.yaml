@@ -480,8 +480,8 @@ esphome:
       - script.execute: check_initial_state
 
 packages:
-  - !include repos/gate-controller/packages/esp_common.yaml
-  - !include repos/gate-controller/packages/wemos_d1_mini32.yaml
+  - !include ../packages/esp_common.yaml
+  - !include ../packages/wemos_d1_mini32.yaml
 
 #############################################################################################
 # EXTERNAL COMPONENTS
